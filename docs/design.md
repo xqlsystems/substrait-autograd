@@ -74,9 +74,10 @@ This is not a toy. The design succeeds when:
   [xarray-sql](https://github.com/xqlsystems/xarray-sql) (DataFusion/Python) and
   [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr) (Rust community
   extension).
-- The `grad`/`jvp`/`vjp` surface is **standardized** — one portable definition of
-  what these functions mean, expressed as a Substrait simple-extension, that any
-  engine can adopt.
+- The `grad`/`jvp`/`vjp` surface is **portable** — the same SQL-level functions,
+  with one shared `ddx-core` defining what they mean, adopted by every target
+  engine (rather than each reimplementing differentiation). Portability lives at
+  the SQL surface, not in a plan-interchange format (§6).
 
 ---
 
@@ -161,10 +162,11 @@ needs no engine fork and no custom wheel, and runs against the stock published
 package.
 
 **Consequence:** Substrait is *not* a good fit as the mandatory plan transport.
-But note the failure was specific to **whole plans**. A single **scalar
-expression** (the argument to `grad()`) is well within Substrait's expressive
-core. This is what lets us still use Substrait as a *protocol* and *optional
-expression IR* (§6) without repeating the mistake.
+The failure was specific to **whole plans** — a single scalar expression (the
+argument to `grad()`) is well within Substrait's expressive core — so a Substrait
+*scalar-expression* IR was, for a while, kept as an optional role. v0.2 drops even
+that: SQL text already carries the scalar argument portably, so a second Substrait
+IR earns nothing. See §6 for the full rationale.
 
 ### 3.3 The reusable crown jewel is a small, IR-shaped differentiation engine
 
@@ -184,8 +186,9 @@ expression IR* (§6) without repeating the mistake.
 
 The catch: it is currently written **against DataFusion's `Expr` type**
 (`datafusion::logical_expr::Expr`). The algorithm is engine-independent; the
-*data type it walks* is not. **Generalizing off `Expr` onto a neutral IR is the
-central refactor of this project** (§5.1).
+*data type it walks* is not. **Re-pointing the rules off `Expr` onto the
+engine-neutral `sqlparser::ast::Expr` is the central refactor of this project**
+(§5.1).
 
 ### 3.4 Other inherited design decisions worth keeping
 
@@ -308,10 +311,11 @@ Design notes:
   parse to `f64` for constant folding, and **emit `DOUBLE`-typed literals/casts**
   in output (R1b finding: DuckDB types `0.0` as `DECIMAL`, which would pull
   derivative arithmetic into decimal). Let the engine coerce from there.
-- **Qualifier-aware, hence binding-correct (§5.5):** `ColRef` carries the
-  qualifier from `CompoundIdentifier`, so `grad(a.x + b.x, a.x)` differentiates the
-  right column — no catalog needed, because well-formed SQL already qualifies
-  wherever a bare name would be ambiguous.
+- **Qualifier-aware (§5.5):** `ColRef` carries the qualifier from
+  `CompoundIdentifier`, so `grad(a.x + b.x, a.x)` differentiates the right column
+  with no catalog. An unqualified `wrt` whose name collides under two qualifiers in
+  the argument is a hard error (detectable from the AST alone) — never a silent
+  mismatch (§5.5).
 - Port the prototype's 15 rule unit tests; they pin the math unchanged.
 
 **Deps: `sqlparser` only.** No DataFusion, no `protoc`, no engine crate. This is
@@ -327,7 +331,7 @@ The whole surface each integration wires up:
 
 | Integration | Dialect | How the rewritten SQL reaches the engine |
 | --- | --- | --- |
-| **Rust DataFusion** (`ddx-datafusion` helper) | `GenericDialect` / DataFusion's | `ctx.sql(rewrite_sql(sql)?)` — a one-line wrapper; see below |
+| **Rust DataFusion** (`ddx-datafusion` helper) | `GenericDialect` / DataFusion's | `ctx.sql(rewrite_sql(sql, dialect)?)` — a one-line wrapper; see below |
 | `ddxdb` (Python → DataFusion) | `GenericDialect` / DataFusion-compatible | `Context.sql()` shim calls `rewrite_sql`, then the stock datafusion-python context plans it |
 | `ddxdb` for DuckDB-python | `DuckDbDialect` | preprocess the string before `duckdb.sql(...)` |
 | `ddx` (DuckDB ext) | `DuckDbDialect` | `ddx('<sql>')` table fn calls `rewrite_sql`, runs it on an inner connection (§5.4) |
@@ -339,7 +343,9 @@ string, then hand it to the stock `SessionContext`:
 
 ```rust
 // The entire v1 "integration" for native Rust DataFusion.
-pub async fn ddx_sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
+// (Returns datafusion::Result; assumes `impl From<DiffError> for DataFusionError`
+// so the `?` on rewrite_sql composes — a one-liner in the ddx-datafusion crate.)
+pub async fn ddx_sql(ctx: &SessionContext, sql: &str) -> DataFusionResult<DataFrame> {
     let rewritten = ddx_core::rewrite_sql(sql, &GenericDialect {})?;
     ctx.sql(&rewritten).await
 }
@@ -391,8 +397,7 @@ engine regardless of path. Out of scope for v1.
 limitation to work around. `ddxdb` re-exports `ddx-core::rewrite_sql(sql, dialect)`
 and a `Context.sql()` shim; xarray-sql consumes it, deleting its vendored
 `autograd.rs` in favor of `ddx-core` (regression-tested against the PR's Python
-suite). A native `ddx-datafusion` `AnalyzerRule` (Path B) for *Rust* DataFusion
-users is future work (§5.3), not needed for the xarray-sql target.
+suite). (Native Rust DataFusion is covered separately just below.)
 
 **DataFusion (native Rust) / `ddx-datafusion`.**
 The lowest-friction integration of all, because DataFusion is built on the same
@@ -464,8 +469,9 @@ options that remain:
      index* (`ColumnBinding`), so a bound `Expression` does **not** round-trip to
      re-parseable SQL — the SQL-text boundary we use elsewhere is unavailable here.
      The boundary must carry the expression *structurally*: either (i) serialize
-     DuckDB's expression to bytes and write a `ddx-duckdb` Rust deserializer into
-     `DExpr` (clean, but couples to DuckDB's internal serialization format), or
+     DuckDB's expression to bytes and write a Rust deserializer into `ddx-core`'s
+     `sqlparser::ast::Expr` (clean, but couples to DuckDB's internal serialization
+     format), or
      (ii) expose the C++ `Expression` tree to Rust as cxx opaque types with
      accessors and rebuild a bound expression from Rust (most code, tight version
      coupling). (i) is the likely first cut. `autocxx` (auto-binding DuckDB's
@@ -522,22 +528,31 @@ concern mostly dissolves — and the fix is small:
   as a `CompoundIdentifier`, so `ColRef { qualifier: Some("a"), name: "x" }` falls
   out for free. `grad(a.x + b.x, a.x)` differentiates the right column with no
   catalog. This is strictly better than the prototype's unqualified-only form.
-- **The key insight: qualifier-aware syntactic differentiation is *binding-correct*
-  for every query the engine accepts.** SQL itself *requires* qualification exactly
-  when a bare name would be ambiguous across joined tables — so if a reference is
-  unqualified, it is already unambiguous, and matching it by name matches the same
-  column the engine would bind. We rely on the user's SQL being well-formed (which
-  the engine enforces anyway), not on our own binder.
+- **Qualifier-aware differentiation is binding-correct — with one guard.** For a
+  *qualified* `wrt` (`a.x`), or an unqualified `wrt` whose name is not reused under
+  another qualifier in the argument, matching by `ColRef` picks exactly the column
+  the engine would bind. The case that needs care: an **unqualified `wrt` whose
+  bare name appears under two different qualifiers in the argument** — e.g.
+  `grad(a.x * b.x, x)` in a self-join `FROM t a JOIN t b`. Treating both `a.x` and
+  `b.x` as "the same `x`" is wrong, and because we rewrite *before* binding, the
+  engine never gets the chance to reject the ambiguity. A naïve "match by bare
+  name" would silently return a wrong derivative here.
+- **We catch that case syntactically — no catalog needed.** The argument AST itself
+  reveals the collision: if the `wrt` name occurs under ≥2 distinct qualifiers (or
+  both qualified and bare) inside the expression being differentiated, an
+  unqualified `wrt` is ambiguous → **hard error** asking for qualification
+  (`grad(a.x * b.x, a.x)`). This detection needs only the expression, not a binder,
+  so it keeps the "fail loud, never silently wrong" guarantee (§4.5).
+- **The remaining unqualified cases fail loud downstream.** If the reference is
+  *wholly* unqualified in a genuinely ambiguous scope (`grad(sin(x), x)` with `x`
+  in two joined tables), the rewrite emits SQL that still contains the bare `x`,
+  which the engine then rejects as ambiguous when it plans the rewritten query. So
+  no silent wrong answer escapes; what catalog-driven **Path B** adds is
+  *resolving* such cases (and `SELECT *` expansion) rather than erroring — deferred
+  with Path B (§5.3).
 - **Aliases need no catalog either.** In `SELECT a+b AS s, grad(s*s, s)`, treating
   the identifier `s` as the differentiation variable is exactly right
   (`d/ds (s*s) = 2s`); the surrounding query re-substitutes `s`.
-- **Residual edge cases → explicit error, never a guess.** A genuinely ambiguous
-  *unqualified* `wrt` in a multi-scope query (e.g. an unqualified name that SQL
-  scoping would resolve to an inner correlated subquery) is a typed error asking
-  for qualification — not a silent mismatch. Full catalog-driven resolution
-  (`SELECT *` expansion, correlated-scope disambiguation without qualifiers) is a
-  **Path B** capability (differentiate the engine's already-bound tree) and is
-  deferred with Path B (§5.3).
 
 **Net:** v1 is qualifier-aware syntactic differentiation — which honors "don't be
 limited to unqualified names" while needing no binder. This is a deliberate,
@@ -588,7 +603,9 @@ this project.
   Multi-input directional derivative = sum of `jvp` terms.
 - `vjp(expr, column, cotangent)` → reverse-mode `cotangent · d(expr)/d(column)`.
 - `differentiate_sql(expr, wrt)` → derivative as SQL text (the "calculus
-  compiler" escape hatch).
+  compiler" escape hatch). The prototype's third `columns` argument (§3.4) is
+  dropped: it existed only to synthesize a DataFusion schema for standalone
+  parsing, which `sqlparser` does not need.
 - Rules: `+ - * /`, unary chain rule for the trig/inverse-trig/exp/log/hyperbolic
   set + `abs`, `power` with constant base or exponent. Higher-order via nesting.
   Through-aggregate via linearity (`AGG(grad(...))`).
@@ -696,9 +713,10 @@ Distribution:
   `ddx-substrait` only if/when the future work lands.)
 - Python: `pip install ddxdb`.
 - DuckDB: `INSTALL ddx FROM community;` → the `ddx('<sql>')` table function (§5.4).
-- Repo: already renamed `substrait-autograd` → `ddx` (local; the GitHub remote is
-  still `xqlsystems/substrait-autograd` pending a rename). Tagline: "SQL-portable
-  autograd," *not* "Substrait" (§6).
+- Repo: renamed `substrait-autograd` → `ddx`, both locally and on GitHub
+  (`github.com/xqlsystems/ddx`; the old name redirects). The local git remote URL
+  may still read `substrait-autograd.git` until repointed — harmless, GitHub
+  redirects it. Tagline: "SQL-portable autograd," *not* "Substrait" (§6).
 
 ---
 
