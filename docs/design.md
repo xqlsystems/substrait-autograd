@@ -12,9 +12,11 @@ _status_: Design — iterating toward implementation.
 
 > **Revision note (2026-07-19, v0.2 — strategic simplification).** After review, the
 > design collapses along three axes that earlier drafts left open:
-> 1. **One injection path for v1, not two.** Both v1 targets need the SQL
->    source-to-source rewrite ("Path A"); neither needs a native in-engine plan
->    rewrite ("Path B"). Path B is demoted to future work (§5.3).
+> 1. **SQL rewrite ("Path A") is the universal path.** Both acceptance targets are
+>    reached by it alone. We *also* ship one in-engine rewrite ("Path B") in v1 —
+>    an `AnalyzerRule` for native Rust DataFusion — as the cheap reference proof
+>    that `ddx-core` drives an in-engine rewrite (§5.3); other engines' Path B is
+>    future.
 > 2. **One IR: the `sqlparser` AST**, not a bespoke `DExpr` + adapters. We
 >    differentiate directly on `sqlparser::ast::Expr`, parse per-dialect, and
 >    unparse via `Display` (§5.1). The core then depends only on `sqlparser` — no
@@ -92,8 +94,10 @@ This is not a toy. The design succeeds when:
 - **Not** a Substrait project. Substrait is off the critical path (§6): no
   whole-plan round-trip (§3.2 explains why the prototype removed it), and — as of
   v0.2 — no Substrait expression IR or dependency either.
-- **Not** two injection paths in v1. The native in-engine plan rewrite ("Path B")
-  is deferred; v1 ships the SQL rewrite ("Path A") only (§5.3).
+- **Not** two injection paths *everywhere* in v1. The SQL rewrite ("Path A") is
+  the universal path; the in-engine plan rewrite ("Path B") ships in v1 for **one**
+  engine only — native Rust DataFusion, as the reference in-engine integration
+  (§5.3). Other engines' Path B (notably DuckDB's C++ hybrid) is deferred.
 - **Postgres is later** — it needs array/XQL support first (via `pgrx`), and its
   planner-hook story differs from the two first targets.
 
@@ -215,10 +219,11 @@ engine-neutral `sqlparser::ast::Expr` is the central refactor of this project**
 2. **Rewrite, don't execute.** Markers are erased before execution. Every
    integration is fundamentally "parse, find the marker, differentiate its
    argument, splice the derivative back, hand plain SQL onward."
-3. **One injection path in v1: the SQL source-to-source rewrite.** It reaches
-   every v1 target and distribution channel (§5.3). A native in-engine plan
-   rewrite ("Path B") is a *future* enhancement for engines that expose the hook,
-   not a co-equal pillar.
+3. **One universal path + one reference in-engine path.** The SQL source-to-source
+   rewrite ("Path A") reaches every v1 target and channel. We *also* ship the
+   in-engine `AnalyzerRule` ("Path B") for native Rust DataFusion in v1 — the
+   cheapest proof that `ddx-core` drives an in-engine rewrite, not merely a text
+   preprocess (§5.3). Other engines' Path B is future.
 4. **SQL is the portable surface; Substrait is off the critical path.** grad/jvp/vjp
    are ordinary SQL function calls syntactically, so portability is free at the SQL
    level. Substrait solves plan interchange, not our problem (rewrite injection),
@@ -256,17 +261,21 @@ job; everything else is explicitly future.
         │ → xarray-sql, DuckDB-python   │ → duckdb-zarr                     │
         └───────────────────────────────┴───────────────────────────────────┘
 
-   Future (not v1): ddx-datafusion (native AnalyzerRule, "Path B") · C++/cxx.rs
-   hybrid for bare grad() in DuckDB (§5.4 opt 4) · ddx-pg (pgrx) · Substrait (§6)
+   Also v1: ddx-datafusion — bare grad() via an in-engine AnalyzerRule (Path B),
+   the reference native integration (§5.3).
+   Future (not v1): C++/cxx.rs hybrid for bare grad() in DuckDB (§5.4 opt 4) ·
+   ddx-pg (pgrx) · Substrait (§6)
 ```
 
-**Why one path is enough (was: "do we need both A and B?").** Both v1 targets are
-reached by the SQL rewrite alone: xarray-sql *must* use it (datafusion-python can't
-inject an `AnalyzerRule`, R2), and the DuckDB `ddx('<sql>')` table function *is*
-the SQL rewrite executed inside the extension (§5.4). A native in-engine rewrite
-("Path B") buys nicer ergonomics (bare `grad()` with no wrapper) but reaches no
-target the one path doesn't already reach. So v1 builds one path; Path B is a
-later ergonomic upgrade per engine.
+**Paths in v1 (was: "do we need both A and B?").** The **SQL rewrite (Path A)** is
+universal and reaches both acceptance targets on its own: xarray-sql *must* use it
+(datafusion-python can't inject an `AnalyzerRule`, R2) and the DuckDB `ddx('<sql>')`
+table function *is* the rewrite inside the extension (§5.4). We *also* build the
+**in-engine `AnalyzerRule` (Path B) for native Rust DataFusion** — not because a
+target needs it, but because it is the cheapest way to validate that `ddx-core`
+drives a real in-engine plan rewrite (the other half of the thesis, §3.1), and it
+is nearly free via an unparse→core→reparse bridge that reuses the one rule engine
+(§5.3). DuckDB's bare-`grad()` Path B (C++ hybrid) stays post-v1.
 
 ### 5.1 `ddx-core` — the engine (the refactor)
 
@@ -360,34 +369,43 @@ The prototype's `rewrite_grad_in_sql` / `GradSqlRewriter` is exactly this driver
 minus its detour through DataFusion `Expr` (it currently parses to DF `Expr` to
 differentiate, then unparses; we differentiate the `ast::Expr` directly instead).
 
-### 5.3 The one path, and the future Path B
+### 5.3 The two v1 paths: universal SQL rewrite + DataFusion in-engine rule
 
-**The path (v1).** Intercept the SQL string before it reaches the engine, rewrite
-every `grad`/`jvp`/`vjp` call to derivative SQL, pass plain SQL onward. It runs
-*before* planning, so it works for every query shape the parser accepts —
-recursive CTEs, DML, subqueries — which is what lets a whole training loop live in
-one query. This is what the prototype settled on and what all v1 integrations use.
+**Path A — SQL source-to-source rewrite (universal, every target).** Intercept the
+SQL string before it reaches the engine, rewrite every `grad`/`jvp`/`vjp` call to
+derivative SQL, pass plain SQL onward. It runs *before* planning, so it works for
+every query shape the parser accepts — recursive CTEs, DML, subqueries — which is
+what lets a whole training loop live in one query. xarray-sql and the DuckDB
+extension rely on it.
 
-**Path B (future, per engine).** A native in-engine plan rewrite so `grad()` works
-bare with no wrapper (e.g. `SELECT grad(sin(x), x) FROM t` directly). It reaches no
-new *target*, so it is deferred — but it is a real ergonomic upgrade, and its cost
-differs sharply by engine:
-- **DataFusion (Rust) — cheap, available now, likely the first Path B.** Register
-  the markers, then install an `AnalyzerRule`/`FunctionRewrite` over the bound
-  `LogicalPlan`. Uniquely, this needs **no second rule engine**: DataFusion already
-  ships an `Expr`→SQL unparser (`expr_to_sql`) and a SQL→`Expr` planner, so the
-  rule can lift each `grad()` argument to SQL, call the *same* `ddx-core` rewrite,
-  and plan the result back — reusing the one rule set the sqlparser-IR choice gives
-  us. (Alternatively, port the prototype's `differentiate(&Expr)` natively, but the
-  bridge avoids duplicate logic.) Not reachable from datafusion-python (R2), so it
-  serves native-Rust users only. Because it's so cheap here, `ddx-datafusion` may
-  offer *both* the v1 helper (§5.2) and this rule.
-- **DuckDB — expensive.** Needs the C++/cxx.rs hybrid (§5.4 option 4); the stable C
-  API has no hook (R1). Post-v1.
+**Path B — in-engine plan rewrite, shipped for native DataFusion in v1.** A marker
+UDF + `AnalyzerRule` so `grad()` works bare, with no wrapper (`SELECT grad(sin(x),
+x) FROM t` directly), across both the SQL and DataFrame APIs. We promote this into
+v1 for exactly one engine — native Rust DataFusion — because it is the cheapest
+possible **validation of the core architectural claim**: that `ddx-core` can drive
+an *in-engine* plan-time rewrite, not just a text preprocess. Both Path-A targets
+exercise only the text path, so without this the "portable rewrite hook" half of
+the thesis (§3.1) would ship unproven — and it de-risks the much harder DuckDB C++
+boundary by exercising the same pattern first, cheaply.
 
-Either way Path B differentiates the engine's *bound* expression tree; with the
-`Expr↔SQL` bridge above it still funnels through `ddx-core`, so there is one rule
-engine regardless of path. Out of scope for v1.
+Implementation — the **bridge**, not a second rule engine. The rule walks the bound
+`LogicalPlan`, and for each `grad()` `ScalarFunction`:
+
+1. unparse its argument with DataFusion's `expr_to_sql`, which emits a
+   `sqlparser::ast::Expr` — *exactly* `ddx-core`'s input type;
+2. differentiate via `ddx-core`;
+3. re-plan the resulting `ast::Expr` back to a DataFusion `Expr` against the node's
+   schema; replace and recompute the schema.
+
+One rule engine, shared verbatim with Path A. And because the input `Expr` is
+already **bound**, its columns unparse *qualified*, so this path is binding-aware
+for free — the §5.5 ambiguity guard never even fires. We deliberately do **not**
+resurrect the prototype's native `differentiate(&Expr)`: that would reintroduce the
+duplicate rule set v0.2 removed, taxing every future rule (§7) twice.
+
+**Still future.** DataFusion Path B is *not* reachable from datafusion-python (R2),
+so xarray-sql keeps Path A. DuckDB's bare-`grad()` Path B needs the C++/cxx.rs
+hybrid (§5.4 option 4; the stable C API has no hook, R1) and stays post-v1.
 
 ### 5.4 Per-engine integration & distribution
 
@@ -400,17 +418,17 @@ and a `Context.sql()` shim; xarray-sql consumes it, deleting its vendored
 suite). (Native Rust DataFusion is covered separately just below.)
 
 **DataFusion (native Rust) / `ddx-datafusion`.**
-The lowest-friction integration of all, because DataFusion is built on the same
-`sqlparser` crate `ddx-core` differentiates over. v1 is a one-line helper —
-`ctx.sql(ddx_core::rewrite_sql(sql, dialect)?)` (§5.2) — shippable as a small
-`ddx-datafusion` crate or simply inlined by the caller; no fork, no custom build.
-The only care point is parsing with the dialect DataFusion itself uses, so the
-rewrite accepts exactly what `ctx.sql` would. This is *not* a required v1 milestone
-(the acceptance targets are xarray-sql and duckdb-zarr) but is essentially free to
-offer. Native Rust is also the one place **Path B** (bare `grad()`, no wrapper) is
-cheap and available today — an `AnalyzerRule` that reuses `ddx-core` via
-DataFusion's `Expr`↔SQL bridge (§5.3) — so if/when we build any Path B, it lands
-here first, well before DuckDB's C++ route.
+The reference in-engine integration, and a v1 deliverable. The `ddx-datafusion`
+crate (deps: `ddx-core` + `datafusion`) exposes two entry points:
+- **`ddx_sql(ctx, sql)` helper (Path A):** one line —
+  `ctx.sql(ddx_core::rewrite_sql(sql, dialect)?)` (§5.2). Parse with the dialect
+  DataFusion uses so the rewrite accepts exactly what `ctx.sql` would.
+- **Marker UDFs + `AnalyzerRule` (Path B):** bare `grad()` with no wrapper, across
+  the SQL *and* DataFrame APIs, via the unparse→`ddx-core`→reparse bridge (§5.3) —
+  one rule engine, binding-aware for free. It ships in v1 as the cheapest proof
+  that `ddx-core` drives an in-engine rewrite, even though neither acceptance
+  target needs it (xarray-sql is Python → Path A; duckdb-zarr is DuckDB), and it
+  de-risks the harder DuckDB C++ boundary by exercising the same pattern first.
 
 **DuckDB / `ddx` community extension (Rust) → duckdb-zarr.**
 _Settled by spike R1 (2026-07-19)._ Reading DuckDB's actual C Extension API
@@ -671,23 +689,25 @@ ddx/                               (repo; crates published under the ddx-* names
 ├── crates/
 │   ├── ddx-core/                   # the engine — differentiate sqlparser::ast::Expr
 │   │                               #   + rewrite_sql; dep: sqlparser only
+│   ├── ddx-datafusion/             # markers + AnalyzerRule (Path B) + ddx_sql helper
+│   │                               #   deps: ddx-core, datafusion
 │   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` table fn
 ├── python/
 │   └── ddxdb/                      # PyO3/maturin wheel: rewrite_sql + Context.sql() shim
 ├── docs/
 │   └── design.md                   # this file
 ├── tests/                          # cross-engine numeric-agreement suites (vs JAX)
-└── future/                         # not v1 — see §5.3 / §5.4 / §6
-    ├── ddx-datafusion/             #   native AnalyzerRule (Path B) for Rust DataFusion
+└── future/                         # not v1 — see §5.4 / §6
     ├── ddx-duckdb-cpp/             #   C++/cxx.rs hybrid for bare grad() (§5.4 opt 4)
     └── ddx-substrait/              #   only if a Substrait-native engine asks (§6)
 ```
 
-Rationale: the v1 surface is just **`ddx-core` + `ddx-duckdb` + `ddxdb`**.
-`ddx-core` publishes independently (dep: `sqlparser`) so anyone can drive it from a
-new engine. No `protoc` anywhere. Future crates are physically separated so the v1
-build stays trivial. (The `future/` directory is illustrative — those may live as
-un-published workspace members or separate repos.)
+Rationale: the v1 surface is **`ddx-core` + `ddx-datafusion` + `ddx-duckdb` +
+`ddxdb`**. `ddx-core` publishes independently (dep: `sqlparser` only, no `protoc`,
+**no DataFusion**) so anyone can drive it from a new engine; the heavy `datafusion`
+dependency is quarantined in `ddx-datafusion`. Future crates are physically
+separated so the v1 build stays light. (The `future/` directory is illustrative —
+those may live as un-published workspace members or separate repos.)
 
 ---
 
@@ -709,8 +729,8 @@ un-published workspace members or separate repos.)
 
 Distribution:
 
-- Rust crates (v1): `ddx-core`, `ddx-duckdb` on crates.io. (`ddx-datafusion`,
-  `ddx-substrait` only if/when the future work lands.)
+- Rust crates (v1): `ddx-core`, `ddx-datafusion`, `ddx-duckdb` on crates.io.
+  (`ddx-substrait` only if/when a Substrait-native engine needs it.)
 - Python: `pip install ddxdb`.
 - DuckDB: `INSTALL ddx FROM community;` → the `ddx('<sql>')` table function (§5.4).
 - Repo: renamed `substrait-autograd` → `ddx`, both locally and on GitHub
@@ -733,10 +753,13 @@ critical dependency; the two integrations then go in parallel.
 - **M1 — Confirm R2** (short). Verify datafusion-python still can't inject an
   `AnalyzerRule` (keeps v1 on the rewrite). *Exit:* v1 path confirmed; any Path B
   seam noted as future-only.
-- **M2 — DataFusion / Python.** `ddxdb` wheel: `rewrite_sql` + `Context.sql()`
-  shim. Re-integrate into xarray-sql, deleting its vendored `autograd.rs` in favor
-  of `ddx-core`. *Exit:* xarray-sql green on `ddx-core`, no regressions, checked
-  against JAX.
+- **M2 — DataFusion (Python + native Rust).** (a) `ddxdb` wheel: `rewrite_sql` +
+  `Context.sql()` shim; re-integrate into xarray-sql, deleting its vendored
+  `autograd.rs` in favor of `ddx-core`. (b) `ddx-datafusion`: marker UDFs + the
+  `AnalyzerRule` bridge (unparse→`ddx-core`→reparse), plus the `ddx_sql` helper.
+  *Exit:* xarray-sql green on `ddx-core` (vs JAX, no regressions) **and** bare
+  `grad()` runs end-to-end through the `AnalyzerRule` in a native DataFusion test —
+  the first proof of an in-engine rewrite.
 - **M3 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (read SQL
   literal → `rewrite_sql` with `DuckDbDialect` → execute on inner connection →
   stream), plus the `ddxdb` client-side path for DuckDB-python. Integrate with
@@ -744,9 +767,9 @@ critical dependency; the two integrations then go in parallel.
   end-to-end via `SELECT * FROM ddx('…')` on a real duckdb-zarr dataset.
 - **M4 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
   vs. JAX, dialect canonicalization table, docs, benchmarks.
-- **Future (post-v1, demand-driven):** native DataFusion `AnalyzerRule` (Path B),
-  the C++/cxx.rs hybrid for bare `grad()` in DuckDB (§5.4 opt 4), `ddx-pg`, and a
-  Substrait front-end only if a Substrait-native engine asks (§6).
+- **Future (post-v1, demand-driven):** the C++/cxx.rs hybrid for bare `grad()` in
+  DuckDB (§5.4 opt 4), `ddx-pg`, and a Substrait front-end only if a
+  Substrait-native engine asks (§6).
 
 ---
 
