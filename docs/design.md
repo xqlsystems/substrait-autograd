@@ -4,6 +4,8 @@ _author_: Alex Merose
 
 _co-author_: Claude (Opus 4.8), via Claude Code
 
+_reviewed by_: Claude (Fable 5), 2026-07-19 — adversarial review in §13
+
 _created_: 2026-07-19
 
 _last updated_: 2026-07-19
@@ -790,6 +792,217 @@ Answers from Alex's review (2026-07-19), folded in:
    is no umbrella `ddx` crate — we don't need one. `ddx-core`, `ddx-datafusion`,
    `ddx-duckdb`, and `ddxdb` are all **free on crates.io**; `ddxdb` is **free on
    PyPI**; `ddx` is **free on the DuckDB community registry** (`INSTALL ddx`). (§10.)
+
+---
+
+## 13. Adversarial review (2026-07-19, Fable 5)
+
+_Reviewed: this doc (v0.2) plus the prototype it is grounded in —
+[xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192), all 13
+commits and the final `autograd.rs` / `sql.py` / `lib.rs`. Scout's mindset: the
+point is an accurate map, so this section records both where the terrain matches
+the doc and where it doesn't._
+
+**What holds up under attack** (briefly, because it's load-bearing): the
+markers-not-UDFs finding (§3.1) is correct and the prototype's
+`invoke`-must-error design is the right enforcement of it. The Substrait
+rejection (§6) is earned — it was tried, it failed on exactly the query shapes
+the thesis needs, and there's a repro. The v0.2 collapse to one IR is good
+taste: deleting `DExpr` + four adapters removes a whole class of drift bugs.
+R1/R1b are real spikes with falsifiable findings, not vibes.
+
+The findings below are ordered by severity within each group. **F1–F4 can
+produce a silently wrong number** — each is a violation of principle 5 ("fail
+loud, never silently wrong") hiding inside the current plan, and I'd treat all
+four as M0-blocking. F5–F7 are systems risks that bound how far the design
+carries. F8–F12 are API and semantic debts that are cheap to fix before
+`ddx-core` publishes and expensive after.
+
+### 13.1 Silent-wrong findings (principle-5 violations)
+
+**F1 — Column identity is raw-string equality, but SQL identifiers aren't.**
+`ColRef` matching as specified compares the strings the parser saw. SQL
+unquoted identifiers are case-insensitive (DuckDB is case-insensitive
+throughout; DataFusion lowercases unquoted identifiers at planning). So in
+DuckDB, `grad(Temp * Temp, temp)` differentiates w.r.t. a variable the matcher
+never finds in the expression → derivative **0**, silently. This is also a
+concrete **regression risk for the M2 "no regressions" gate**: the prototype
+parses marker calls through DataFusion's own `parse_sql_expr`
+(`autograd.rs::rewrite_call`), which applies identifier normalization, so
+`X`/`x` match today; the sqlparser-only core loses that for free. *Fix:*
+per-dialect identifier folding when constructing/comparing `ColRef` (casefold
+unquoted, exact-match quoted; preserve original spelling in output). Add the
+case tests in M0, before xarray-sql swaps internals.
+
+**F2 — The §5.5 ambiguity guard is one-sided.** It fires only for an
+*unqualified* `wrt`. The mirror case is silently wrong: a **qualified `wrt`
+with a bare occurrence of the same name in the argument**. Repro: `FROM t a
+JOIN u b` where only `t` has column `x`; the engine binds bare `x` to `a.x`, so
+`grad(x * a.x, a.x)` is d/d(a.x) of `x²` = `2x` — but syntactic matching treats
+bare `x` as a different (constant) leaf and returns `x`. Wrong number, no
+error, and the emitted SQL is perfectly bindable so nothing fails downstream
+either. *Fix:* extend the guard to a symmetric rule — if the `wrt` base name
+occurs with **mixed qualification** (both bare and qualified, or under ≥2
+qualifiers) anywhere in the argument, hard-error and demand full qualification,
+regardless of whether `wrt` itself is qualified. Same cost as the existing
+guard: AST-only, no catalog. Add a row to the §7.1 refusal table.
+
+**F3 — Derivatives don't commute with query composition; the doc never says
+so.** Differentiation stops at column leaves, so any column that is *computed*
+upstream — a CTE, subquery, or view projection — is an opaque constant. Repro:
+
+```sql
+WITH v AS (SELECT x, sin(x) AS s FROM t)
+SELECT grad(s * x, x) FROM v      -- ddx: ds/dx = 0  →  s      = sin(x)
+-- inline v by hand:
+SELECT grad(sin(x) * x, x) FROM t -- ddx: cos(x)*x + sin(x)
+```
+
+Two refactorings any SQL user considers equivalent give different derivatives.
+As relational semantics this is *defensible* — every projection boundary is a
+`stop_gradient` — but it is currently an **undocumented convention with a
+silent failure mode**, and it lands exactly on the pitched use case (users
+factoring a loss into CTEs will silently drop gradient terms). §5.5's alias
+paragraph ("treating `s` as the differentiation variable is exactly right")
+asserts the convention without naming it. *Fix, two parts:* (a) state the
+contract loudly in §5.5/§7.1: *columns are leaves; `grad` differentiates the
+expression as written against the relation it queries, never through view/CTE
+definitions*. (b) A cheap syntactic guard is available for the worst subcase:
+`rewrite_sql` sees the whole statement, so when a marker argument references an
+identifier that is a **computed select-list alias of a CTE/derived table in the
+same statement**, error (or warn) with "differentiate inside the CTE instead."
+That guard can't see catalog views — say so; the residual risk is
+documentation-only.
+
+**F4 — The DOUBLE-literal rule doesn't cover literal-free derivatives; integer
+division truncates.** R1b's "emit `DOUBLE` literals" fix only helps
+expressions that *contain* literals. The quotient rule routinely emits
+literal-free SQL: `grad(x / y, y)` → `(-x) / (y * y)` after 0/1-folding. On
+`BIGINT` columns in DataFusion, `/` is **integer division**: x=1, y=2 gives
+`-1/4 = 0` instead of `-0.25` — silently, and only on some engines (DuckDB's
+`/` is float division, so the cross-engine equivalence suite would diverge here
+too). *Fix:* the type policy belongs in the **smart constructors**, not the
+literals — e.g. `div()` wraps its numerator in `CAST(… AS DOUBLE)` whenever
+operand types are unknown (they always are, pre-binding). Slightly noisier
+output; correct everywhere. Pin with an integer-column test in M0.
+
+### 13.2 Systems risks
+
+**F5 — `sqlparser` becomes a whole-query gatekeeper, and reprinting amplifies
+it.** Path A must parse the *entire* statement, so `ddx-core`'s applicability
+is bounded by sqlparser's per-dialect coverage — not by what the marker
+touches. Any DuckDB surface sqlparser lags on (`FROM`-first queries, `SELECT *
+EXCLUDE`, lambdas, `PIVOT`, next release's syntax…) fails the **whole** query
+inside `ddx('…')`, even when the `grad` itself is `grad(x*x, x)`. DuckDB moves
+fast; sqlparser's `DuckDbDialect` follows with a lag; this is a permanent
+version-treadmill the doc should name as such. Two mitigations, one of which
+should be v1: (a) **no-marker queries must pass through byte-identical** — never
+parse-and-reprint a query you aren't changing (the `ddxdb` regex gate happens to
+give this; make it a stated invariant of `rewrite_sql` too). (b) **Splice by
+source span instead of reprinting the statement**: sqlparser's `Spanned` gives
+the marker call's byte range in the original text; replace just that range and
+leave every other byte alone. Parsing coverage remains the hard bound, but
+reprint fidelity (comments stripped, formatting lost, canonical-form drift
+across the whole statement — all of which today's `Display`-based plan incurs)
+stops being a risk surface. It's cheap; I'd do it in M0.
+
+**F6 — Symbolic expression swell, and nothing shares.** Product/quotient rules
+duplicate their operands: `|d(f·g)| ≈ |f|+|g|+|df|+|dg|`, so a product chain of
+n factors yields an O(n²) derivative, and repeated differentiation
+(`grad(grad(…))` — advertised) compounds multiplicatively; this is the classic
+symbolic-differentiation blowup, and 0/1-folding does not prevent it, only
+trims the easy zeros. Consequences are systemic, not cosmetic: SQL text size,
+parse/plan time, and **per-row recomputation** of repeated subexpressions
+(`tanh(x)` appearing k times is k evaluations unless the engine's CSE catches
+it — engine-dependent, partial). An N-parameter gradient is N `grad` columns
+that each re-derive the whole loss, multiplying the swell by N. *Fix:* accept
+for v1 but (a) add a size/latency benchmark to M4 so the cliff is measured, not
+discovered; (b) note the post-v1 remedy — a "let-binding" pass that factors
+shared subexpressions into projected columns (`…, cos(x) AS __ddx_t1`) or a
+CTE. See also F10: the surface has no reverse-mode accumulation to amortize
+this.
+
+**F7 — `ddx('…')` has unvalidated mechanics and loses session state.** Three
+gaps R1/R1b did not cover: (a) **Bind-time schema**: a DuckDB table function
+must declare result columns at bind; deriving them requires
+preparing/describing the *rewritten* query on the inner connection during bind.
+Feasible-looking, but it's the actual heart of M3 and hasn't been spiked. (b)
+**Connection-scoped state**: the inner `duckdb_connect` is a new session —
+the caller's **temporary tables, session `SET`s, and prepared statements are
+invisible** inside `ddx('…')`. R1b covered transaction visibility only; this is
+a broader (and more common) surprise and belongs in the same "when to use
+client-side Path A" guidance. (c) **Precedent & policy**: DuckDB ships a
+built-in `query('sql')` table function with the same shape — deliberately
+restricted to SELECT. R1b proudly notes inner DML "works"; decide *on purpose*
+whether `ddx('…')` permits DML (community-extension review may object, and the
+client-side path already covers stateful loops). Also: SQL-in-a-string quoting
+is genuinely unpleasant for the flagship recursive-CTE examples — document
+dollar-quoting (`ddx($$ … $$)`) as the house style.
+
+**F8 — The markers hijack every function spelled `grad`/`jvp`/`vjp`.** The
+prototype's `is_marker_name` (and the design's rewrite) claims those names
+unconditionally — including a user's own UDF or a qualified `myschema.grad(…)`.
+Fine to reserve the names, but *reserve them explicitly*: match only unqualified
+spellings, and document the reservation. (The `ddxdb` regex gate also matches
+inside string literals — harmless today because the real parse decides, but
+worth a comment so nobody "optimizes" the gate into the rewrite itself.)
+
+### 13.3 API & semantic debts (cheap now, expensive after publishing)
+
+**F9 — The rule registry has no seam in the public API.** §5.1 sells
+user-registrable rules, but every signature in the doc is a free function —
+`rewrite_sql(sql, dialect)`, `differentiate(e, wrt)`. Where does the user's
+registry go? As drafted this forces global mutable state (or an API break)
+later. *Fix in M0, before crates.io:* make the entry point an object —
+`Ddx::new(registry).rewrite_sql(…)` (default registry = built-ins) — which also
+gives dialect canonicalization config a home.
+
+**F10 — `vjp` is not reverse mode; say so.** As specified,
+`vjp(expr, col, ct) = ct · d(expr)/d(col)` is a cotangent-scaled *forward*
+pass, one per column — there is no reverse accumulation, so the thing reverse
+mode is *for* (all N input sensitivities in one pass) is absent, and N-parameter
+gradients pay N forward passes (compounding F6). The surface is fine; the
+"reverse-mode" framing in §7 oversells it and will mislead exactly the JAX
+users the project courts. One honest sentence fixes it.
+
+**F11 — 0/1-folding changes NULL semantics; pin the convention.** Folding
+`d/dx(x + y)` to `1` means the derivative is `1` even on rows where `y IS NULL`
+and the primal is `NULL`. That matches JAX's treatment of NaN-contaminated
+tangents and is a defensible convention — but folded and unfolded derivatives
+now *disagree* on NULL-bearing rows, so it must be a documented decision with a
+test, not an accident of the simplifier.
+
+**F12 — Kinks and domain edges will make the oracle and the engines disagree.**
+Three predictable flaps in the §8 test plan: (i) `abs` at 0 — the `signum` rule
+gives 0; JAX's convention at the kink differs (verify: `jax.grad(jnp.abs)(0.0)`
+is reportedly 1.0), so pin convention points explicitly rather than comparing
+blindly. (ii) Derivatives **widen the domain of failure**: `sqrt(x)` at `x=0`
+evaluates fine, but its derivative `1/(2*sqrt(x))` divides by zero — and
+engines disagree on what that does (IEEE `inf` vs `NULL` vs error). The
+derivative query can fail where the primal didn't, differently per engine;
+cross-engine equivalence needs a stated policy at domain edges (sample away
+from them, or pin per-engine expectations). (iii) Same for `tan` near π/2,
+`ln` near 0.
+
+### 13.4 Suggested plan deltas
+
+- **M0** grows four exit criteria: identifier normalization + case tests (F1),
+  the symmetric mixed-qualification guard (F2), the numeric-type policy in the
+  smart constructors + integer-column tests (F4), and the `Ddx`-object API shape
+  (F9). Decide span-splicing vs. reprint (F5) here too — it changes `rewrite_sql`'s
+  internals.
+- **§5.5/§7.1**: state the projection-boundary contract and add refusal-table
+  rows for F2 and the F3 same-statement alias guard.
+- **M3**: add the bind-time-schema spike and the DML policy decision (F7) as
+  named tasks, not discoveries.
+- **M4**: add the swell benchmark (F6) and convention-pinning tests (F11, F12).
+
+**Overall:** the architecture is sound and the v0.2 simplification is the right
+call — none of the findings above argue for a different shape, and several
+(F1, F2, F9) are only visible *because* the design is now simple enough to
+attack precisely. But four of them produce wrong numbers under the current
+text, and this is a numerical-correctness product; they're small fixes, and
+they belong in M0, not in a postmortem.
 
 ---
 
