@@ -10,6 +10,22 @@ _last updated_: 2026-07-19
 
 _status_: Design — iterating toward implementation.
 
+> **Revision note (2026-07-19, v0.2 — strategic simplification).** After review, the
+> design collapses along three axes that earlier drafts left open:
+> 1. **One injection path for v1, not two.** Both v1 targets need the SQL
+>    source-to-source rewrite ("Path A"); neither needs a native in-engine plan
+>    rewrite ("Path B"). Path B is demoted to future work (§5.3).
+> 2. **One IR: the `sqlparser` AST**, not a bespoke `DExpr` + adapters. We
+>    differentiate directly on `sqlparser::ast::Expr`, parse per-dialect, and
+>    unparse via `Display` (§5.1). The core then depends only on `sqlparser` — no
+>    DataFusion `Expr`, no `protoc`.
+> 3. **Substrait leaves the critical path** (§6). SQL is already the portable
+>    surface for grad/jvp/vjp; Substrait would be a redundant second IR that does
+>    not solve our real portability problem (rewrite injection).
+>
+> This supersedes the earlier "both paths as peers" and "Substrait as protocol +
+> optional IR" decisions; the reasoning is recorded inline where each applies.
+
 ---
 
 ## 1. Goal & thesis
@@ -25,7 +41,14 @@ SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
 and get derivatives back as ordinary columns, evaluated row-by-row by the engine
 alongside everything else.
 
-[//]: # (TODO&#40;claude&#41; Make a note up front that we assume the XQL data model for arrays, i.e. ND arrays are treated as 2d tables. Please link to an appropriate doc &#40;e.g. https://xql.systems or Xarray-SQL docs&#41;&#41; if readers want to hear more.)
+**Data model (assumed throughout).** We assume the **XQL data model**: an
+N-dimensional array is a long/tidy relational table — one row per coordinate
+tuple, dimensions and variables as columns (`temp(time, lat, lon)` becomes rows of
+`(time, lat, lon, temp)`). Every derivative is therefore just another column
+aligned to the same coordinates, which is what makes `grad` compose with ordinary
+SQL. See [xql.systems](https://xql.systems) and
+[xarray-sql](https://github.com/xqlsystems/xarray-sql) for the model in depth;
+this doc takes it as given.
 
 **Thesis (the vmap insight, carried over from the [prototype](https://github.com/xqlsystems/xarray-sql/pull/192)).** Because each row
 of a table is an independent evaluation point, differentiating a column
@@ -65,8 +88,11 @@ This is not a toy. The design succeeds when:
 - **Not** general `u^v` power, `CASE`/conditional subgradients, or non-smooth ops
   in v1 (tracked in §7 roadmap). The engine returns a clear `NotImplemented`
   rather than a silently-wrong derivative.
-- **Not** whole-plan Substrait round-tripping (§3 explains why the prototype
-  removed it).
+- **Not** a Substrait project. Substrait is off the critical path (§6): no
+  whole-plan round-trip (§3.2 explains why the prototype removed it), and — as of
+  v0.2 — no Substrait expression IR or dependency either.
+- **Not** two injection paths in v1. The native in-engine plan rewrite ("Path B")
+  is deferred; v1 ships the SQL rewrite ("Path A") only (§5.3).
 - **Postgres is later** — it needs array/XQL support first (via `pgrx`), and its
   planner-hook story differs from the two first targets.
 
@@ -98,7 +124,9 @@ before) planning time. UDF *registration* is only there to make the marker
 
 ### 3.2 Substrait as a whole-plan transport was tried and deliberately removed
 
-[//]: # (TODO&#40;claude&#41;: Please file an issue in this GH project that explains the bug in substrait that makes us go with this approach and not a substrait-centric approach. Please add appropriate links to the Xarray-SQL project and attempt steps to reproduce the error. After you've done this, please refer back to that issue in this design section.)
+> Reproduced and written up in **[ddx#1](https://github.com/xqlsystems/ddx/issues/1)**
+> (references [xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192)
+> and [#197](https://github.com/xqlsystems/xarray-sql/issues/197)).
 
 The PR's intermediate design (commit `672e7d0`) round-tripped the entire logical
 plan through Substrait to apply the rewrite in a separately-linked copy of
@@ -108,12 +136,24 @@ DataFusion:
 > `grad()` into the derivative → re-produce Substrait → Python consumes & executes.
 
 The **final commit (`14b26971`) deleted this entirely** ("Differentiate grad() as
-a SQL rewrite, dropping the Substrait bridge"), because:
+a SQL rewrite, dropping the Substrait bridge"), because Substrait's producer could
+not represent the query shapes that make in-SQL *training loops* interesting
+(Newton's method / gradient descent in a `WITH RECURSIVE`, or `INSERT`-ing updated
+parameters), and it required a `protoc` build dependency plus per-engine schema
+plumbing.
 
-- Substrait's plan representation **could not carry recursive CTEs, DML, or
-  subqueries** — precisely the query shapes that make in-SQL *training loops*
-  interesting (e.g. Newton's method / gradient descent in a `WITH RECURSIVE`).
-- It required a `protoc` build dependency and per-engine schema plumbing.
+I re-verified the limitation against **datafusion 54.0.0** (ddx#1); the current
+picture — note it has *shifted* since #197 was filed:
+
+| Query shape | `to_substrait_plan` |
+| --- | --- |
+| Plain scalar projection | ✅ works |
+| Recursive CTE (`WITH RECURSIVE`) | ❌ `Unsupported plan type: RecursiveQuery` |
+| DML (`INSERT … SELECT`) | ❌ `Unsupported plan type: DmlStatement` |
+| Scalar subquery | ✅ works now (**was** broken at #197; fixed upstream) |
+
+So the disqualifying gaps are **recursive CTEs and DML** — exactly the training-loop
+shapes. (Upstream tracking: [apache/datafusion#16248](https://github.com/apache/datafusion/issues/16248).)
 
 The replacement — a **SQL source-to-source rewrite before planning**
 (`rewrite_grad_in_sql`) — works for *any query shape the SQL parser accepts*,
@@ -165,22 +205,21 @@ central refactor of this project** (§5.1).
 
 ## 4. Design principles
 
-1. **Differentiate once, in a neutral IR.** The algorithm lives in `ddx-core`
-   over an engine-agnostic scalar-expression IR (`DExpr`). Everything else is
-   adapters.
+1. **Differentiate once, on the SQL AST.** The algorithm lives in `ddx-core` and
+   operates directly on `sqlparser::ast::Expr` — the same parser DataFusion uses,
+   with a `DuckDbDialect`. No bespoke IR, no per-representation adapters, no engine
+   `Expr` dependency (§5.1). SQL text in, SQL text out.
 2. **Rewrite, don't execute.** Markers are erased before execution. Every
-   integration is fundamentally "find the marker, hand its argument to the core,
-   splice the derivative back."
-3. **Two peer injection paths** (per design decision): a portable **SQL
-   source-to-source rewrite** *and* an **in-engine plan/expression rewrite**.
-   `ddx-core` is agnostic to which one calls it; the difference is only the
-   frontend/backend adapter used (§5.3).
-
-[//]: # (   TODO&#40;claude&#41;: I'm starting to be skeptical of this! Will discuss a concrete question below in 5.)
-
-4. **Substrait is the protocol, not the pipe.** Standardize *what the functions
-   mean* via a Substrait simple-extension; offer Substrait as one *optional*
-   expression IR. Never require a whole-plan round trip (§6).
+   integration is fundamentally "parse, find the marker, differentiate its
+   argument, splice the derivative back, hand plain SQL onward."
+3. **One injection path in v1: the SQL source-to-source rewrite.** It reaches
+   every v1 target and distribution channel (§5.3). A native in-engine plan
+   rewrite ("Path B") is a *future* enhancement for engines that expose the hook,
+   not a co-equal pillar.
+4. **SQL is the portable surface; Substrait is off the critical path.** grad/jvp/vjp
+   are ordinary SQL function calls syntactically, so portability is free at the SQL
+   level. Substrait solves plan interchange, not our problem (rewrite injection),
+   so it is neither a dependency nor a mechanism in v1 (§6).
 5. **Fail loud, never silently wrong.** An unsupported node is a typed error, not
    an approximate derivative. This is a numerical-correctness product.
 6. **Prove it in real projects.** xarray-sql and duckdb-zarr are acceptance
@@ -190,143 +229,183 @@ central refactor of this project** (§5.1).
 
 ## 5. Architecture
 
-A monorepo (Cargo workspace + published Python wheels) with three layers: a pure
-core, IR adapters, and per-engine integrations.
+A monorepo (Cargo workspace + one Python wheel). Two crates and a wheel do the v1
+job; everything else is explicitly future.
 
 ```
-                         ┌───────────────────────────────────────┐
-                         │              ddx-core (Rust)           │
-                         │  DExpr  ·  rule registry  ·  linearize │
-                         │  grad / jvp / vjp  ·  0/1 simplifier   │
-                         │  (no engine deps, no protoc)           │
-                         └───────────────────────────────────────┘
-                             ▲  DExpr in            DExpr out ▼
-        ┌────────────────────┴───────────────┬──────────────────┬───────────────┐
-        │ ddx-sql                            │ ddx-substrait     │ ddx-datafusion │  ... ddx-duckdb
-        │ sqlparser AST ⇄ DExpr              │ Substrait Expr ⇄  │ DF Expr ⇄ DExpr │  DuckDB expr ⇄ DExpr
-        │ (dialect-configurable)             │ DExpr (protoc)    │                │
-        └────────────────────┬───────────────┴──────────────────┴───────────────┘
-                             │ used by
-   ┌─────────────────────────┴───────────────────────────────────────────────────────┐
-   │ Injection path A: SQL rewrite            │ Injection path B: in-engine plan rewrite │
-   │ (portable, client/wrapper, pre-planning) │ (native, per-engine hook)                │
-   └──────────────────────────────────────────┴──────────────────────────────────────────┘
-                             │ shipped as
-   ┌─────────────────────────┴───────────────────────────────────────────────────────┐
-   │ ddxdb (Python wheel)      │ ddx (DuckDB community ext, Rust)  │ ddx-pg (pgrx, later)│
-   │ → xarray-sql, DuckDB-py   │ → duckdb-zarr                     │                     │
-   └───────────────────────────┴───────────────────────────────────┴─────────────────────┘
+                    ┌──────────────────────────────────────────────┐
+                    │                 ddx-core (Rust)              │
+                    │  operates on sqlparser::ast::Expr            │
+                    │  rule registry · linearize · 0/1 simplifier  │
+                    │  grad / jvp / vjp  ·  statement rewriter      │
+                    │  deps: sqlparser only (no protoc, no engine) │
+                    └──────────────────────────────────────────────┘
+                          SQL text in ▲        ▼ SQL text out
+        ┌───────────────────────────┴─────────┴────────────────────────────┐
+        │  The one path (v1): SQL source-to-source rewrite before planning  │
+        │  parse (per-dialect) → find grad/jvp/vjp → differentiate arg →    │
+        │  unparse (Display) → splice → hand plain SQL to the engine        │
+        └───────────────────────────┬─────────┬────────────────────────────┘
+                                     │ shipped as
+        ┌────────────────────────────┴─────────┴───────────────────────────┐
+        │ ddxdb (Python wheel)          │ ddx (DuckDB community ext, Rust)  │
+        │ rewrite_sql + Context.sql()   │ `ddx('<sql>')` table function     │
+        │ → xarray-sql, DuckDB-python   │ → duckdb-zarr                     │
+        └───────────────────────────────┴───────────────────────────────────┘
+
+   Future (not v1): ddx-datafusion (native AnalyzerRule, "Path B") · C++/cxx.rs
+   hybrid for bare grad() in DuckDB (§5.4 opt 4) · ddx-pg (pgrx) · Substrait (§6)
 ```
 
-TODO(claude): At a high level, do we still need both Plan A and Plan B to reach all the distribution channels that we want to target? Is this dual plan still advised? Could we get away with implementing less and still reach all the targets? What do you think?
+**Why one path is enough (was: "do we need both A and B?").** Both v1 targets are
+reached by the SQL rewrite alone: xarray-sql *must* use it (datafusion-python can't
+inject an `AnalyzerRule`, R2), and the DuckDB `ddx('<sql>')` table function *is*
+the SQL rewrite executed inside the extension (§5.4). A native in-engine rewrite
+("Path B") buys nicer ergonomics (bare `grad()` with no wrapper) but reaches no
+target the one path doesn't already reach. So v1 builds one path; Path B is a
+later ergonomic upgrade per engine.
 
 ### 5.1 `ddx-core` — the engine (the refactor)
 
-Port `src/autograd.rs` out of xarray-sql, generalized off DataFusion `Expr` onto
-a small owned IR. Sketch:
+Port the prototype's `src/autograd.rs`, but change the type it walks: **off
+DataFusion `Expr`, onto `sqlparser::ast::Expr`** — the [`sqlparser`
+crate](https://docs.rs/sqlparser/) (Apache's `datafusion-sqlparser-rs`, the same
+parser DataFusion uses; **not** the third-party `sqlparser-patched`). It ships
+`DuckDbDialect`, `PostgreSqlDialect`, `GenericDialect`, …, and `ast::Expr: Display`
+so a differentiated AST renders straight back to SQL. Surface:
 
 ```rust
-pub struct ColRef {              // qualified column identity (see §5.5)
-    pub qualifier: Option<String>,   // e.g. Some("era5") for era5.temp
-    pub name: String,
-}
+// Differentiate one scalar expression w.r.t. a column, both as sqlparser AST.
+pub fn differentiate(e: &ast::Expr, wrt: &ColRef) -> Result<ast::Expr, DiffError>; // grad
+pub fn jvp(e: &ast::Expr, seeds: &HashMap<ColRef, ast::Expr>) -> Result<ast::Expr, DiffError>;
+pub fn vjp(e: &ast::Expr, wrt: &ColRef, cotangent: &ast::Expr) -> Result<ast::Expr, DiffError>;
 
-pub enum DExpr {
-    Const(f64),
-    Column(ColRef),               // matched against `wrt` by qualified identity
-    Neg(Box<DExpr>),
-    Binary(BinOp, Box<DExpr>, Box<DExpr>),   // + - * /
-    Call(String, Vec<DExpr>),     // "sin", "power", ... — name-dispatched rules
-    Cast(Box<DExpr>, DType),      // locally linear
-}
+// Statement-level rewrite: parse, find every grad/jvp/vjp call, differentiate its
+// argument, splice the derivative back, return SQL text. This is the whole path.
+pub fn rewrite_sql(sql: &str, dialect: &dyn Dialect) -> Result<String, DiffError>;
 
-pub fn differentiate(e: &DExpr, wrt: &ColRef) -> Result<DExpr, DiffError>; // grad
-pub fn jvp(e: &DExpr, seeds: &HashMap<ColRef, DExpr>) -> Result<DExpr, DiffError>;
-pub fn vjp(e: &DExpr, wrt: &ColRef, cotangent: &DExpr) -> Result<DExpr, DiffError>;
+// A column identity read straight off the AST (Identifier / CompoundIdentifier).
+pub struct ColRef { pub qualifier: Option<String>, pub name: String }
 ```
 
-[//]: # (TODO&#40;claude&#41;: I think a better design would be to adopt a common SQL Parser and IR. DataFusion's own parser is https://docs.rs/sqlparser-patched/latest/sqlparser/index.html and I would prefer to use that. It even comes with a DuckDB SQL dialect if I understand correctly: https://docs.rs/sqlparser-patched/latest/sqlparser/dialect/struct.DuckDbDialect.html)
+The rules match on the `ast::Expr` variants we support and `NotImplemented` the
+rest: `Expr::BinaryOp{left,op,right}` (`+ - * /`), `Expr::Function` (name-dispatched:
+`sin`, `power`, …), `Expr::UnaryOp`(minus), `Expr::Cast`, `Expr::Nested`,
+`Expr::Identifier`/`CompoundIdentifier` (leaves), `Expr::Value` (literals). This
+is essentially what the earlier draft's `DExpr` enum *was* — a stripped-down SQL
+expression tree — so we use `sqlparser`'s type directly and delete both the
+bespoke IR and its four `From`/`To` adapters.
 
 Design notes:
 
-- The **rule registry is keyed by function *name* (a string)**, exactly as the
-  prototype already does (`match name { "sin" => ... }`). This is what makes the
-  core engine-agnostic: every engine names `sin` the same, and name-dispatch
-  needs no engine types. Adapters normalize dialect-specific spellings (e.g.
-  DuckDB `ln` vs `log`) into canonical names before handing off.
-- Keep the **smart constructors** (`add/sub/mul/div/neg/square`) verbatim — they
-  are the `Zero`/`add_tangents` analog and are already well-tested.
-- **No `f64`-only assumption baked into the surface**: types don't change the
-  derivative's *form*, and casts are locally linear, so the symbolic pass is
-  type-agnostic. But emit **`DOUBLE`-typed literals/casts** in the output (R1b side
-  finding: DuckDB types `0.0` as `DECIMAL`, which would drag derivative arithmetic
-  into decimal). Let the engine's type system handle final coercion.
-- **Prefer binding-aware inputs (§5.5):** feed the core *bound* expressions with
-  resolved `ColRef`s where the engine can supply them; the synthesized-schema
-  syntactic path is a documented fallback mode, not the default.
-- Port the prototype's 15 Rust unit tests directly; they pin the rules.
+- **Rule registry keyed by function name string** (as the prototype does:
+  `match name { "sin" => … }`). Engine-agnostic, since function names come straight
+  off the parsed call. A small canonicalization table folds dialect spellings (e.g.
+  `ln`/`log`, `pow`/`power`) to one canonical name before dispatch (§7).
+- **Keep the smart constructors** (`add/sub/mul/div/neg/square`) — the
+  `Zero`/`add_tangents` 0/1-folding simplifier — building `ast::Expr` nodes now.
+- **Literals:** `sqlparser` stores numbers as strings (`Value::Number("0.0", _)`);
+  parse to `f64` for constant folding, and **emit `DOUBLE`-typed literals/casts**
+  in output (R1b finding: DuckDB types `0.0` as `DECIMAL`, which would pull
+  derivative arithmetic into decimal). Let the engine coerce from there.
+- **Qualifier-aware, hence binding-correct (§5.5):** `ColRef` carries the
+  qualifier from `CompoundIdentifier`, so `grad(a.x + b.x, a.x)` differentiates the
+  right column — no catalog needed, because well-formed SQL already qualifies
+  wherever a bare name would be ambiguous.
+- Port the prototype's 15 rule unit tests; they pin the math unchanged.
 
-**This crate has zero engine dependencies and does not need `protoc`.** That is
-the whole point — it is the reusable component the goal calls for.
+**Deps: `sqlparser` only.** No DataFusion, no `protoc`, no engine crate. This is
+the reusable component the goal calls for, and it is smaller than the earlier
+core-plus-adapters design.
 
-### 5.2 IR adapters (frontends + backends)
+### 5.2 The rewrite driver (was: IR adapters)
 
-Each adapter is a `From`/`To` between `DExpr` and one representation. They are
-independent, feature-gated, and individually testable via round-trip properties.
+There are no IR adapters anymore — the AST *is* the IR. What each integration
+provides is a **thin driver** that (a) picks the right `sqlparser` `Dialect`,
+(b) calls `ddx-core::rewrite_sql`, and (c) hands the resulting SQL to the engine.
+The whole surface each integration wires up:
 
-| Adapter | In (frontend) | Out (backend) | Needs `protoc`? | Primary use |
-| --- | --- | --- | --- | --- |
-| `ddx-sql` | parse SQL scalar expr (sqlparser-rs) → `DExpr` | `DExpr` → SQL text | no | Path A (portable SQL rewrite) |
-| `ddx-datafusion` | DataFusion `Expr` → `DExpr` | `DExpr` → `Expr` | no | Path B in DataFusion-Rust |
-| `ddx-duckdb` | DuckDB bound/parsed expr → `DExpr` | `DExpr` → DuckDB expr / SQL | no | `ddx('…')` table fn (§5.4) |
-| `ddx-substrait` | Substrait `Expression` → `DExpr` | `DExpr` → `Expression` | yes | protocol conformance + optional IR |
+| Integration | Dialect | How the rewritten SQL reaches the engine |
+| --- | --- | --- |
+| **Rust DataFusion** (`ddx-datafusion` helper) | `GenericDialect` / DataFusion's | `ctx.sql(rewrite_sql(sql)?)` — a one-line wrapper; see below |
+| `ddxdb` (Python → DataFusion) | `GenericDialect` / DataFusion-compatible | `Context.sql()` shim calls `rewrite_sql`, then the stock datafusion-python context plans it |
+| `ddxdb` for DuckDB-python | `DuckDbDialect` | preprocess the string before `duckdb.sql(...)` |
+| `ddx` (DuckDB ext) | `DuckDbDialect` | `ddx('<sql>')` table fn calls `rewrite_sql`, runs it on an inner connection (§5.4) |
 
-[//]: # (TODO&#40;Claude&#41;: What is the use of Substrait at this point? Is it still worthwile? Should we change trying to adhere to it if we slim down from two plans to one plan? What value does it provide us and it is essential? )
+**Native Rust DataFusion is the most direct consumer of `ddx-core`,** and in v0.2
+it is *simpler* than before, not missing. DataFusion is built on the very
+`sqlparser` crate `ddx-core` uses, so the integration is just: rewrite the SQL
+string, then hand it to the stock `SessionContext`:
 
-`ddx-sql` is effectively the prototype's `rewrite_grad_in_sql` /
-`GradSqlRewriter` generalized: parse the statement, visit for marker calls,
-differentiate the argument via `ddx-core`, unparse, splice in place. Dialect is a
-parameter (`GenericDialect` today; per-engine dialects later).
+```rust
+// The entire v1 "integration" for native Rust DataFusion.
+pub async fn ddx_sql(ctx: &SessionContext, sql: &str) -> Result<DataFrame> {
+    let rewritten = ddx_core::rewrite_sql(sql, &GenericDialect {})?;
+    ctx.sql(&rewritten).await
+}
+```
 
-### 5.3 The two injection paths (peers)
+No AnalyzerRule, no fork, no custom build — this is the same one path, called from
+Rust. It can live as a tiny `ddx-datafusion` convenience crate or just be inlined
+by the caller; it is *not* a required v1 milestone (our two acceptance targets are
+xarray-sql and duckdb-zarr), but it is essentially free to offer.
 
-Both paths call the *same* `ddx-core`. They differ only in *when/where* the
-rewrite fires and *which adapter* feeds it.
+The prototype's `rewrite_grad_in_sql` / `GradSqlRewriter` is exactly this driver,
+minus its detour through DataFusion `Expr` (it currently parses to DF `Expr` to
+differentiate, then unparses; we differentiate the `ast::Expr` directly instead).
 
-**Path A — SQL source-to-source rewrite (portable, proven).**
-The caller intercepts the SQL string before it reaches the engine, rewrites
-markers to derivative SQL, and passes plain SQL onward. Works for *every* engine
-and every query shape the parser accepts (recursive CTEs, DML, subqueries).
-Lives in a thin wrapper (`ctx.sql()` shim in Python; a helper/pragma in an
-extension). This is exactly what the prototype settled on and what
-`ddxdb`/xarray-sql use.
+### 5.3 The one path, and the future Path B
 
-**Path B — in-engine plan/expression rewrite (native).**
-The rewrite runs *inside* the engine as a plan-time pass over its own expression
-trees, so `INSTALL ddx` "just works" with no client wrapper.
+**The path (v1).** Intercept the SQL string before it reaches the engine, rewrite
+every `grad`/`jvp`/`vjp` call to derivative SQL, pass plain SQL onward. It runs
+*before* planning, so it works for every query shape the parser accepts —
+recursive CTEs, DML, subqueries — which is what lets a whole training loop live in
+one query. This is what the prototype settled on and what all v1 integrations use.
 
-- **DataFusion (Rust):** register the markers, then install an `AnalyzerRule`
-  (or `FunctionRewrite`/`ExprPlanner`) that walks the logical plan and applies
-  the prototype's already-written `rewrite_grad_calls` (`transform_up` over
-  `Expr`). This path is well-supported and low-risk in Rust.
-- **DuckDB:** see §5.4 — the hook availability is the project's biggest open
-  question.
+**Path B (future, per engine).** A native in-engine plan rewrite so `grad()` works
+bare with no wrapper (e.g. `SELECT grad(sin(x), x) FROM t` directly). It reaches no
+new *target*, so it is deferred — but it is a real ergonomic upgrade, and its cost
+differs sharply by engine:
+- **DataFusion (Rust) — cheap, available now, likely the first Path B.** Register
+  the markers, then install an `AnalyzerRule`/`FunctionRewrite` over the bound
+  `LogicalPlan`. Uniquely, this needs **no second rule engine**: DataFusion already
+  ships an `Expr`→SQL unparser (`expr_to_sql`) and a SQL→`Expr` planner, so the
+  rule can lift each `grad()` argument to SQL, call the *same* `ddx-core` rewrite,
+  and plan the result back — reusing the one rule set the sqlparser-IR choice gives
+  us. (Alternatively, port the prototype's `differentiate(&Expr)` natively, but the
+  bridge avoids duplicate logic.) Not reachable from datafusion-python (R2), so it
+  serves native-Rust users only. Because it's so cheap here, `ddx-datafusion` may
+  offer *both* the v1 helper (§5.2) and this rule.
+- **DuckDB — expensive.** Needs the C++/cxx.rs hybrid (§5.4 option 4); the stable C
+  API has no hook (R1). Post-v1.
 
-Because `ddx-core` is injection-agnostic, an engine can offer **both**: Path B
-for the common case, Path A as a fallback for query shapes an engine's own hook
-can't reach.
+Either way Path B differentiates the engine's *bound* expression tree; with the
+`Expr↔SQL` bridge above it still funnels through `ddx-core`, so there is one rule
+engine regardless of path. Out of scope for v1.
 
 ### 5.4 Per-engine integration & distribution
 
 **DataFusion / `ddxdb` (Python) → xarray-sql.**
 `datafusion-python` does not expose injecting an `AnalyzerRule` into its
-`SessionContext` — which is *why the prototype uses Path A*. So:
-- `ddxdb` ships Path A (the SQL rewrite) as its default for Python/DataFusion,
-  re-exporting `rewrite_sql(sql, dialect)` and a `Context.sql()` shim. xarray-sql
-  consumes this — ideally deleting its vendored `autograd.rs` and depending on
-  `ddx-core` instead (regression-tested against the PR's Python suite).
-- `ddx-datafusion` (Path B) targets *native Rust* DataFusion users and any future
-  datafusion-python hook.
+`SessionContext` (R2) — which is *why* the SQL rewrite is the path here, not a
+limitation to work around. `ddxdb` re-exports `ddx-core::rewrite_sql(sql, dialect)`
+and a `Context.sql()` shim; xarray-sql consumes it, deleting its vendored
+`autograd.rs` in favor of `ddx-core` (regression-tested against the PR's Python
+suite). A native `ddx-datafusion` `AnalyzerRule` (Path B) for *Rust* DataFusion
+users is future work (§5.3), not needed for the xarray-sql target.
+
+**DataFusion (native Rust) / `ddx-datafusion`.**
+The lowest-friction integration of all, because DataFusion is built on the same
+`sqlparser` crate `ddx-core` differentiates over. v1 is a one-line helper —
+`ctx.sql(ddx_core::rewrite_sql(sql, dialect)?)` (§5.2) — shippable as a small
+`ddx-datafusion` crate or simply inlined by the caller; no fork, no custom build.
+The only care point is parsing with the dialect DataFusion itself uses, so the
+rewrite accepts exactly what `ctx.sql` would. This is *not* a required v1 milestone
+(the acceptance targets are xarray-sql and duckdb-zarr) but is essentially free to
+offer. Native Rust is also the one place **Path B** (bare `grad()`, no wrapper) is
+cheap and available today — an `AnalyzerRule` that reuses `ddx-core` via
+DataFusion's `Expr`↔SQL bridge (§5.3) — so if/when we build any Path B, it lands
+here first, well before DuckDB's C++ route.
 
 **DuckDB / `ddx` community extension (Rust) → duckdb-zarr.**
 _Settled by spike R1 (2026-07-19)._ Reading DuckDB's actual C Extension API
@@ -346,8 +425,9 @@ options that remain:
      header exposes `duckdb_bind_get_parameter` (read a **literal SQL string at
      bind time**) and `duckdb_connect` + `duckdb_query` (**execute a query from
      inside the extension**). So a `ddx('<sql>')` table function reads the query
-     literal, rewrites markers via `ddx-core`+`ddx-sql`, executes the plain SQL on
-     a connection to the same database, and streams the result back:
+     literal, rewrites markers via `ddx-core::rewrite_sql` (with `DuckDbDialect`),
+     executes the plain SQL on a connection to the same database, and streams the
+     result back:
      ```sql
      INSTALL ddx FROM community;
      SELECT * FROM ddx('SELECT grad(sin(x), x) AS d FROM t');
@@ -432,74 +512,70 @@ the FFI.
 **Postgres / `ddx-pg` (`pgrx`) — later.** Needs array/XQL support first; native
 Path B would use a planner hook. Out of scope for v1.
 
-### 5.5 Binding-aware differentiation (design decision)
+### 5.5 Column identity: qualifier-aware is binding-correct
 
-The prototype differentiates **syntactically** — before name binding — so marker
-arguments must use *unqualified* column names (`grad(y - a*x - b, a)`), and
-`grad(a.x + b.x, a.x)` is ambiguous. **Decision: `ddx` invests in
-binding-aware differentiation and is not limited to the syntactic form.** We won't
-be bound by the prototype's shortcut where we can do better; where an engine can't
-give us bound columns, we degrade explicitly rather than silently.
+The earlier draft worried that a *syntactic* (pre-binding) rewrite forces
+*unqualified* column names and can't tell `a.x` from `b.x`. Working it through, the
+concern mostly dissolves — and the fix is small:
 
-What this means concretely:
+- **`ColRef` reads the qualifier straight off the AST.** `sqlparser` parses `a.x`
+  as a `CompoundIdentifier`, so `ColRef { qualifier: Some("a"), name: "x" }` falls
+  out for free. `grad(a.x + b.x, a.x)` differentiates the right column with no
+  catalog. This is strictly better than the prototype's unqualified-only form.
+- **The key insight: qualifier-aware syntactic differentiation is *binding-correct*
+  for every query the engine accepts.** SQL itself *requires* qualification exactly
+  when a bare name would be ambiguous across joined tables — so if a reference is
+  unqualified, it is already unambiguous, and matching it by name matches the same
+  column the engine would bind. We rely on the user's SQL being well-formed (which
+  the engine enforces anyway), not on our own binder.
+- **Aliases need no catalog either.** In `SELECT a+b AS s, grad(s*s, s)`, treating
+  the identifier `s` as the differentiation variable is exactly right
+  (`d/ds (s*s) = 2s`); the surrounding query re-substitutes `s`.
+- **Residual edge cases → explicit error, never a guess.** A genuinely ambiguous
+  *unqualified* `wrt` in a multi-scope query (e.g. an unqualified name that SQL
+  scoping would resolve to an inner correlated subquery) is a typed error asking
+  for qualification — not a silent mismatch. Full catalog-driven resolution
+  (`SELECT *` expansion, correlated-scope disambiguation without qualifiers) is a
+  **Path B** capability (differentiate the engine's already-bound tree) and is
+  deferred with Path B (§5.3).
 
-- **The core IR carries qualified column identity** (`ColRef`, §5.1). `wrt` and the
-  leaf/seed maps match on `(qualifier, name)`, not a bare string — so
-  `grad(a.x + b.x, a.x)` differentiates w.r.t. the right column.
-- **Differentiate *bound* expression trees where possible.** This is exactly the
-  domain of **Path B**: the prototype already ships a plan-level rewriter
-  (`rewrite_grad_calls`, `transform_up` over bound `Expr`) that sees resolved,
-  qualified columns. In native DataFusion, the `AnalyzerRule` gets binding for
-  free. Note the prototype's move to SQL-text was to escape *Substrait's* shape
-  limits (§3.2), **not** a limitation of plan-level rewriting — DataFusion binds
-  recursive CTEs, subqueries, and DML fine.
-- **Make Path A binding-aware too, when the engine can bind.** Instead of parsing
-  each marker argument standalone against a synthesized `Float64` schema (the
-  prototype's `call_schema`), the binding-aware Path A **plans the whole query to a
-  bound logical plan, runs the plan-level rewrite over resolved columns, and
-  executes the plan** — no Substrait, no re-unparse to SQL. For DataFusion this is
-  available today; for the DuckDB `ddx('…')` table function the inner connection
-  can bind and rewrite before executing.
-- **Degrade explicitly for un-bindable inputs.** If a target truly can't hand us
-  bound columns (a pure text preprocessor with no catalog), fall back to the
-  syntactic rewrite and **document the unqualified-name constraint as a mode**, not
-  the default. Ambiguous references in that mode are a typed error, never a guess.
-
-Open sub-questions this raises are tracked in §12 Q2 (name resolution across
-joins, correlated subqueries, and how `jvp`/`vjp` seed maps key on `ColRef`).
+**Net:** v1 is qualifier-aware syntactic differentiation — which honors "don't be
+limited to unqualified names" while needing no binder. This is a deliberate,
+partial revision of the earlier "invest fully in binding awareness now" decision:
+the fully-bound path rides along with Path B rather than blocking v1. Open
+sub-question in §12 Q2.
 
 ---
 
-## 6. Substrait's role (resolved)
+## 6. Substrait: off the critical path (revised)
 
-Per design decision, Substrait is **protocol + optional IR**, never the mandatory
-plan pipe. Concretely:
+**Decision (v0.2): Substrait is not a mechanism or a dependency in `ddx`.** This
+supersedes the earlier "protocol + optional IR" role. The project name shed
+"substrait" (→ `ddx`) for the same reason. Three questions settle it:
 
-1. **Standardized function definitions (the main contribution).** Publish a
-   Substrait *simple-extension* YAML (`extensions/ddx.yaml`) declaring
-   `grad`/`jvp`/`vjp` with a URN (`extension:ddx:autograd`), argument/return
-   types, and semantics. This is the portable, engine-neutral *definition* of the
-   surface — exactly the mechanism
-   [Substrait UDFs](https://substrait.io/expressions/user_defined_functions/) and
-   [extensions](https://substrait.io/extensions/) are designed for. Any engine
-   that speaks Substrait can discover and agree on what these functions mean,
-   even though the *implementation* is a rewrite rather than a runtime kernel.
-   (Note: these are "marker" functions; we'll document that they are compile-time
-   rewrites and must not reach execution — a semantics an engine's Substrait
-   consumer should honor.)
+1. **Is Substrait needed for portability?** No. `grad`/`jvp`/`vjp` are ordinary SQL
+   function calls *syntactically*, and every target speaks SQL, so **SQL is already
+   the portable surface**. A Substrait `Expression` IR would be a *second*,
+   redundant portable format — with a `protoc` build tax — carrying no expression
+   we can't already carry as SQL text.
+2. **Does Substrait solve our actual problem?** No. Our problem is *rewrite
+   injection* — getting a plan-time hook in each engine so a marker is differentiated
+   before execution (§3.1). Substrait standardizes *plan interchange*, not
+   *plan-time rewriting*, and it has no notion of a "marker function that must not
+   execute." A Substrait definition of `grad` would advertise a runtime function
+   that no compliant consumer could actually run. Even with it, each engine still
+   needs its own rewrite hook — so it saves no integration work.
+3. **The whole-plan bridge is already rejected** (§3.2) for recursive CTEs / DML /
+   subqueries.
 
-2. **Optional expression interchange IR.** `ddx-substrait` maps a *scalar*
-   Substrait `Expression` ⇄ `DExpr`. An engine that already produces Substrait for
-   expressions can differentiate a `grad()` argument via the core without a SQL
-   round trip. This stays away from §3.2's failure because it round-trips only the
-   *scalar argument*, never a whole plan with recursion/DML.
+So there is no `ddx-substrait` crate, no `ddx.yaml`, no `protoc`, and no R3 spike.
 
-3. **Explicitly NOT** a whole-plan produce→rewrite→consume bridge. That path is
-   documented as a rejected alternative (§3.2) so we don't rebuild it.
-
-This honors the substrait.io goal at the level where Substrait is genuinely
-strong (a shared vocabulary for functions and scalar expressions) while using the
-prototype-proven SQL rewrite as the default portable mechanism.
+**Door left open (cheap, non-blocking).** If a Substrait-native engine (Velox,
+etc.) ever wants to adopt `ddx`, the surface *can* be declared as a Substrait
+simple-extension at that point, and `ddx-core`'s AST rules could be fronted by a
+Substrait-`Expression`→AST adapter. That is a future adapter behind a feature
+flag, written on demand — not part of the v1 architecture, and not what defines
+this project.
 
 ---
 
@@ -535,66 +611,66 @@ Differentiation is a numerical-correctness feature; the test strategy is
 layered and reuses the prototype's:
 
 - **Unit (rule) tests in `ddx-core`** — port the prototype's 15 Rust tests;
-  every rule pinned symbolically.
-- **Adapter round-trip property tests** — `DExpr → repr → DExpr` is identity;
-  `parse → differentiate → unparse` produces parseable SQL. Fuzz small random
-  expression trees.
-- **Numeric agreement (the ground truth)** — for a battery of expressions,
-  compare the engine-evaluated derivative against a **finite-difference**
-  estimate *and* against numpy analytic derivatives, per engine. This is what the
-  prototype's `tests/test_autograd.py` does and it is the acceptance bar.
- 
-[//]: # (  TODO&#40;claude&#41;: I recommend comparing against JAX instead of numpy.)
-- **Cross-engine equivalence** — the *same* expression differentiated through
-  `ddx-sql` (Path A) and through the DataFusion/DuckDB native adapters (Path B)
-  must produce numerically equal columns.
+  every rule pinned symbolically on `ast::Expr`.
+- **Round-trip property tests** — `parse → differentiate → unparse` produces
+  parseable SQL that re-parses to an equal AST; fuzz small random expression trees
+  per dialect.
+- **Numeric agreement (the ground truth) — against JAX.** For a battery of
+  expressions, compare the engine-evaluated derivative against **`jax.grad`** (and
+  `jax.jvp`/`jax.vjp` for those surfaces), which is the natural oracle: the whole
+  design mirrors JAX's forward-mode structure, so JAX gives an exact analytic
+  reference for the same seed/cotangent semantics — a closer match than hand-coded
+  numpy derivatives. Keep a **finite-difference** check as a cheap independent
+  cross-check where a JAX equivalent is awkward. (The prototype checked against
+  numpy analytics; JAX is the upgrade.)
+- **Cross-engine equivalence** — the *same* expression rewritten with
+  `DuckDbDialect` vs. the DataFusion-compatible dialect must evaluate to
+  numerically equal columns in DuckDB and DataFusion respectively.
 - **Real-integration acceptance** — end-to-end gradient descent and a recursive-
   CTE training loop converging to closed-form solutions, run inside xarray-sql and
   duckdb-zarr.
 
 **Open research spikes (do these early — they de-risk the plan):**
 
-- **R1 — RESOLVED (2026-07-19).** A DuckDB Rust community extension *cannot* do a
-  native bare-`grad()` rewrite: the C Extension API has no parser/optimizer/plan
-  hooks. Use an in-extension `ddx('<sql>')` table function (Path A inside the
-  extension) as the primary route; C++ `OptimizerExtension` is the stretch goal
-  for bare `grad()`. Full verdict in §5.4.
+- **R1 — RESOLVED (2026-07-19).** DuckDB's C Extension API has no
+  parser/optimizer/plan hooks; use the in-extension `ddx('<sql>')` table function.
+  C++/cxx.rs hybrid is the future route to bare `grad()`. Full verdict in §5.4.
 - **R1b — RESOLVED (2026-07-19).** `ddx('…')`'s inner-connection re-entrancy is
-  safe (reads, DML, no deadlock); the inner connection runs in its own transaction
-  and can't see the caller's *uncommitted* state → self-contained queries use
-  `ddx('…')`, stateful/transactional loops use client-side Path A. Full findings in
-  §5.4. Remaining: a Rust-extension smoke test in M3.
-- **R2:** Confirm `datafusion-python` still can't inject an `AnalyzerRule` (keeps
-  Path A as the Python default), or find the seam if it can.
-- **R3:** Validate `ddx-substrait` scalar-expression round-trip fidelity for the
-  full v1 rule set (does the simplified derivative survive Substrait ⇄ back?).
+  safe (reads, DML, no deadlock); it runs in its own transaction (can't see the
+  caller's *uncommitted* state), so self-contained queries use `ddx('…')` and
+  stateful loops use the client-side rewrite. Remaining: a Rust-extension smoke
+  test in M3.
+- **R2:** Confirm `datafusion-python` still can't inject an `AnalyzerRule` — this is
+  what keeps v1 on the SQL rewrite. (If a seam exists, it only *adds* a future
+  Path B; it does not change v1.)
+- ~~**R3** (Substrait round-trip)~~ — dropped with Substrait (§6).
 
 ---
 
 ## 9. Monorepo layout (proposed)
 
-[//]: # (TODO&#40;claude&#41;: This repo structure looks good, but the project title should be `ddx`.)
 ```
-substrait-autograd/                (repo; crates published under the ddx-* names)
+ddx/                               (repo; crates published under the ddx-* names)
 ├── crates/
-│   ├── ddx-core/                   # the engine — DExpr, rules, linearize (no engine deps)
-│   ├── ddx-sql/                    # sqlparser frontend/backend  → Path A
-│   ├── ddx-substrait/              # Substrait Expression ⇄ DExpr (protoc, feature-gated)
-│   ├── ddx-datafusion/             # DataFusion Expr adapter + AnalyzerRule → Path B
-│   └── ddx-duckdb/                 # DuckDB adapter + community extension → Path B/A
+│   ├── ddx-core/                   # the engine — differentiate sqlparser::ast::Expr
+│   │                               #   + rewrite_sql; dep: sqlparser only
+│   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` table fn
 ├── python/
-│   └── ddxdb/                      # PyO3/maturin wheel: Path A rewrite + Context shim
-├── extensions/
-│   └── ddx.yaml                    # Substrait simple-extension: grad/jvp/vjp definitions
+│   └── ddxdb/                      # PyO3/maturin wheel: rewrite_sql + Context.sql() shim
 ├── docs/
 │   └── design.md                   # this file
-└── tests/                          # cross-engine numeric-agreement suites
+├── tests/                          # cross-engine numeric-agreement suites (vs JAX)
+└── future/                         # not v1 — see §5.3 / §5.4 / §6
+    ├── ddx-datafusion/             #   native AnalyzerRule (Path B) for Rust DataFusion
+    ├── ddx-duckdb-cpp/             #   C++/cxx.rs hybrid for bare grad() (§5.4 opt 4)
+    └── ddx-substrait/              #   only if a Substrait-native engine asks (§6)
 ```
 
-Rationale: `ddx-core` publishes independently so anyone can build a new engine
-adapter without our integration crates. The `protoc` dependency is quarantined to
-`ddx-substrait` (opt-in), so the common build stays light — directly addressing a
-pain point the prototype hit.
+Rationale: the v1 surface is just **`ddx-core` + `ddx-duckdb` + `ddxdb`**.
+`ddx-core` publishes independently (dep: `sqlparser`) so anyone can drive it from a
+new engine. No `protoc` anywhere. Future crates are physically separated so the v1
+build stays trivial. (The `future/` directory is illustrative — those may live as
+un-published workspace members or separate repos.)
 
 ---
 
@@ -616,43 +692,43 @@ pain point the prototype hit.
 
 Distribution:
 
-- Rust crates: `ddx-core`, `ddx-sql`, `ddx-substrait`, `ddx-datafusion`,
-  `ddx-duckdb` on crates.io.
+- Rust crates (v1): `ddx-core`, `ddx-duckdb` on crates.io. (`ddx-datafusion`,
+  `ddx-substrait` only if/when the future work lands.)
 - Python: `pip install ddxdb`.
 - DuckDB: `INSTALL ddx FROM community;` → the `ddx('<sql>')` table function (§5.4).
-- Repo: rename `substrait-autograd` → `ddx` (keep "Substrait-portable" in the
-  tagline rather than the name).
+- Repo: already renamed `substrait-autograd` → `ddx` (local; the GitHub remote is
+  still `xqlsystems/substrait-autograd` pending a rename). Tagline: "SQL-portable
+  autograd," *not* "Substrait" (§6).
 
 ---
 
 ## 11. Milestones
 
-Given the decision to build **both injection paths and both integrations in
-parallel**, the plan front-loads the shared core and the de-risking spikes so the
-two tracks don't diverge. (R1 is already resolved — see §5.4.)
+With one path, one IR, and no Substrait, the plan is short. `ddx-core` is the
+critical dependency; the two integrations then go in parallel.
 
-- **M0 — Extract the core.** Create the workspace; lift `src/autograd.rs` into
-  `ddx-core` over `DExpr`; port all rule unit tests. `ddx-sql` frontend/backend
-  with round-trip tests. *Exit:* `ddx-core` + `ddx-sql` reproduce every
-  prototype rule and the SQL-rewrite behavior, engine-free.
-- **M1 — Remaining spikes** (short, decision-making). R1 and R1b are **done**
-  (§5.4): DuckDB gets an in-extension `ddx('<sql>')` table function (re-entrancy
-  safe), not native `grad()`. Still to settle: R2 (datafusion-python AnalyzerRule
-  seam) and R3 (Substrait scalar round-trip). *Exit:* Path B feasibility per engine
-  final.
-- **M2 — DataFusion track.** `ddx-datafusion` (Path B, native Rust) + `ddxdb`
-  wheel (Path A) ; re-integrate into xarray-sql, replacing its vendored engine.
-  *Exit:* xarray-sql green on `ddx-core`, no regressions.
-- **M3 — DuckDB track.** `ddx-duckdb` = the `ddx('<sql>')` table function
-  (reads SQL literal → rewrite via `ddx-core` → execute on inner connection →
-  stream) + the `ddxdb` client-side path for DuckDB-Python ; integrate with
-  duckdb-zarr. *Exit:* `grad` works end-to-end in DuckDB against a real
-  duckdb-zarr dataset via `SELECT * FROM ddx('…')`.
-- **M4 — Substrait protocol.** Publish `ddx.yaml`; implement `ddx-substrait`
-  scalar round-trip (R3). *Exit:* an engine can consume the standardized
-  definitions; optional Substrait IR path validated.
-- **M5 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
-  suite, docs, benchmarks.
+- **M0 — Extract the core.** Create the workspace; lift the prototype's
+  `src/autograd.rs` into `ddx-core`, re-pointing the rules from DataFusion `Expr`
+  onto `sqlparser::ast::Expr`, and implement `rewrite_sql(sql, dialect)`. Port the
+  15 rule unit tests + round-trip tests. *Exit:* `ddx-core` reproduces every
+  prototype rule and rewrites SQL end-to-end, depending only on `sqlparser`.
+- **M1 — Confirm R2** (short). Verify datafusion-python still can't inject an
+  `AnalyzerRule` (keeps v1 on the rewrite). *Exit:* v1 path confirmed; any Path B
+  seam noted as future-only.
+- **M2 — DataFusion / Python.** `ddxdb` wheel: `rewrite_sql` + `Context.sql()`
+  shim. Re-integrate into xarray-sql, deleting its vendored `autograd.rs` in favor
+  of `ddx-core`. *Exit:* xarray-sql green on `ddx-core`, no regressions, checked
+  against JAX.
+- **M3 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (read SQL
+  literal → `rewrite_sql` with `DuckDbDialect` → execute on inner connection →
+  stream), plus the `ddxdb` client-side path for DuckDB-python. Integrate with
+  duckdb-zarr; run the R1b Rust-extension smoke test. *Exit:* `grad` works
+  end-to-end via `SELECT * FROM ddx('…')` on a real duckdb-zarr dataset.
+- **M4 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
+  vs. JAX, dialect canonicalization table, docs, benchmarks.
+- **Future (post-v1, demand-driven):** native DataFusion `AnalyzerRule` (Path B),
+  the C++/cxx.rs hybrid for bare `grad()` in DuckDB (§5.4 opt 4), `ddx-pg`, and a
+  Substrait front-end only if a Substrait-native engine asks (§6).
 
 ---
 
@@ -662,21 +738,26 @@ two tracks don't diverge. (R1 is already resolved — see §5.4.)
    an acceptable v1 UX. Bare `grad()` remains the aspiration: pursue it later via
    an upstream DuckDB change, a C++ `OptimizerExtension`, or another native hook —
    tracked as a stretch goal (§5.4 option 4), not a v1 blocker.
-2. **Column-name binding — DECIDED (Alex, 2026-07-19): invest in binding
-   awareness (§5.5).** `ddx` is not limited to the prototype's syntactic,
-   unqualified-name form; the core carries qualified `ColRef` identity and we
-   differentiate bound expressions where the engine supplies them, degrading to a
-   documented syntactic *mode* only where binding is unavailable. **Remaining
-   sub-questions:** name resolution across joins / correlated subqueries; how far
-   to push binding-aware Path A (plan-then-rewrite-then-execute) vs. leaving the
-   syntactic fallback; and whether ambiguity is always a hard error.
+2. **Column-name binding — REVISED (v0.2, §5.5).** v1 is **qualifier-aware
+   syntactic** differentiation on the `sqlparser` AST — binding-*correct* for every
+   query the engine accepts (SQL forces qualification exactly where a bare name
+   would be ambiguous), and strictly better than the prototype's unqualified-only
+   form. This partially walks back the earlier "invest fully in binding awareness
+   now" decision: full catalog-driven resolution rides along with the future Path B
+   rather than blocking v1. **For your review:** is qualifier-aware-with-hard-error-
+   on-ambiguity acceptable for v1, or is a case you care about (which?) forcing
+   full binding sooner?
 3. **Where does `ddx-core`'s canonical function vocabulary live** — hard-coded
-   match arms (as today), a registry API consumers can extend, or driven by the
-   Substrait YAML? A registry makes third-party rule packs possible.
+   match arms (as today) vs. a small registry API consumers can extend (third-party
+   rule packs)? (Substrait-YAML-driven is off the table with §6.)
 4. **Should xarray-sql depend on `ddx-core` directly, or vendor-then-migrate?**
    Direct dependency is cleaner but couples release cadences.
 5. **Naming collision check** — is `ddx`/`ddxdb` free on crates.io, PyPI, and the
-   DuckDB community registry?
+   DuckDB community registry? (I can check this quickly on request.)
+6. **Does dropping Substrait cost anything you value?** §6 argues no (SQL is the
+   portable surface; Substrait doesn't solve rewrite injection). Flagging
+   explicitly because the project began as "substrait-autograd" — veto if there's
+   an ecosystem/relationship reason to keep a Substrait artifact in v1.
 
 ---
 
