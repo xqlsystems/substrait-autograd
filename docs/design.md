@@ -20,9 +20,12 @@ _status_: Design — iterating toward implementation.
 >    that `ddx-core` drives an in-engine rewrite (§5.3); other engines' Path B is
 >    future.
 > 2. **One IR: the `sqlparser` AST**, not a bespoke `DExpr` + adapters. We
->    differentiate directly on `sqlparser::ast::Expr`, parse per-dialect, and
->    unparse via `Display` (§5.1). The core then depends only on `sqlparser` — no
->    DataFusion `Expr`, no `protoc`.
+>    differentiate directly on `sqlparser::ast::Expr`, parse per-dialect, and render
+>    back with precedence-safe `Display` (§5.1, G1). The core depends only on
+>    `sqlparser` — no DataFusion `Expr`, no `protoc` — but that public type ties
+>    `ddx-core`'s version to `sqlparser`'s fast-moving 0.x (pin = DataFusion's; §9,
+>    G2). The one virtue the deleted `DExpr` had — insulating the API from that churn
+>    — is the price; recorded, not reversed.
 > 3. **Substrait is dropped** entirely — not a transport, IR, or dependency (§6).
 >
 > This supersedes the earlier "both paths as peers" and "Substrait as protocol +
@@ -64,6 +67,20 @@ This doc is grounded in a working prototype:
 [xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192), which
 implements `grad`/`jvp`/`vjp` for DataFusion. §3 records what that prototype
 taught us; the rest of the doc generalizes it into a reusable component.
+
+**Sweet spot vs. bounded demo (G5).** The honest framing leads with **calculus as
+columns on tidy scientific/array data** — sensitivity columns, small Jacobians,
+Newton steps, curve fitting, physical derivatives alongside gridded data — which is
+exactly the XQL / xarray-sql / duckdb-zarr audience, and which no other SQL-native
+tool does at all. The in-SQL *training loop* is a genuine and impressive demo, but
+it is **bounded to small models by construction**: this is *symbolic* forward-mode
+differentiation, so an SGD step over N parameters costs N independent full
+derivations of the loss, each re-evaluated per row (F6 swell × F10 no-reverse-mode
+— the two multiply). That compounding is *the* canonical reason ML moved from
+symbolic to reverse-mode AD (Baydin et al., JMLR 2018). So: low-N calculus is the
+product; training loops are the wow, with an explicit small-N caveat (§7.2) — not
+a general autodiff engine (§2). This positioning is what M4's benchmark targets
+(swell vs. *N*, not just vs. expression size).
 
 ### 1.1 Success criteria
 
@@ -236,8 +253,12 @@ Port the prototype's `src/autograd.rs`, but change the type it walks: **off
 DataFusion `Expr`, onto `sqlparser::ast::Expr`** — the [`sqlparser`
 crate](https://docs.rs/sqlparser/) (Apache's `datafusion-sqlparser-rs`, the same
 parser DataFusion uses; **not** the third-party `sqlparser-patched`). It ships
-`DuckDbDialect`, `PostgreSqlDialect`, `GenericDialect`, …, and `ast::Expr: Display`
-so a differentiated AST renders straight back to SQL. Surface:
+`DuckDbDialect`, `PostgreSqlDialect`, `GenericDialect`, …, and `ast::Expr: Display`.
+But `Display` is **not precedence-safe** for *constructed* trees (G1, below), so
+rendering back to SQL means "`Display` + explicit `Nested` wrapping," not raw
+`Display`. Version note (G2): `ddx-core` **pins the same `sqlparser` as DataFusion**
+and **re-exports it** (`pub use sqlparser`); a `sqlparser` bump is a breaking release
+of `ddx-core` (§9). Surface:
 
 ```rust
 // Public entry point is an OBJECT (F9), not free functions, so the user rule
@@ -294,6 +315,19 @@ Design notes:
   hit integer inputs) wraps in `CAST(… AS DOUBLE)`, and literals are emitted
   `DOUBLE`-typed (DuckDB otherwise types `0.0` as `DECIMAL`). Slightly noisier
   output, correct on every engine. Pin with an integer-column test in M0.
+- **Smart constructors also own *precedence* — the silent-wrong bug in "unparse via
+  `Display`" (G1).** `sqlparser`'s `Display` for a binary op is literally
+  `{left} {op} {right}` — **no precedence parentheses**. Parsed trees round-trip
+  because the parser keeps explicit parens as `Expr::Nested`, but the differentiator
+  *constructs* new trees, which have none. Verified (sqlparser 0.62.0): a constructed
+  `(a+b)*c` Displays as `a + b * c` (reparses as `a+(b·c)`), and `a−(b+c)` as
+  `a − b + c`. This hits the product/quotient rules immediately (`mul(cos(u), da+db)`
+  → `cos(u) * da + db`) — a wrong number, valid SQL, nothing fails downstream: exactly
+  the principle-5 class. The prototype dodged it only by using DataFusion's unparser,
+  which wraps every op in `Nested` and runs a `remove_unnecessary_nesting` pass. Fix:
+  the smart constructors **wrap composite operands in `Expr::Nested`** (verified to
+  render `(a + b) * c` correctly); a later tidy pass can drop redundant parens.
+  M0 exit criterion alongside F4.
 - **Identifier folding, not raw-string equality (F1) — and the fold is
   *per-dialect*.** SQL unquoted identifiers are case-insensitive, so
   `grad(Temp*Temp, temp)` must match — otherwise it silently yields derivative `0`.
@@ -315,19 +349,27 @@ Design notes:
   occurrence when `wrt` is qualified, or a qualified occurrence when `wrt` is bare.
   A fully-qualified, unambiguous `wrt` like `grad(a.x*b.x, a.x)` is **accepted**.
   AST-only, no catalog (§5.5).
-- **Reserve the marker names precisely (F8).** `grad`/`jvp`/`vjp` are claimed only
-  as **unqualified** function calls; a user's `myschema.grad(…)` is left alone.
-  Document the reservation.
-- **Splice by source span, don't reprint the statement (F5).** `rewrite_sql` first
-  runs a **parse-free pre-gate** — a cheap substring/regex scan for `grad`/`jvp`/
-  `vjp(` — and returns the input **verbatim** if none is present. This is what makes
-  the byte-identical guarantee real: a marker-free statement is *never parsed*, so
-  it can't be failed or reformatted by sqlparser's coverage gaps (§5.3 F5). Only
-  when the gate hits does it parse, and then it replaces just the marker call's byte
-  range (via sqlparser's `Spanned`), leaving every other byte identical. (The gate
-  can over-match inside string literals — harmless, since the subsequent real parse
-  decides; never fold the gate into the rewrite. Confirm `Spanned` coverage for the
-  pinned sqlparser in M0.)
+- **Reserve the marker names precisely (F8), case-insensitively (G7).** `grad`/`jvp`/
+  `vjp` are claimed only as **unqualified** function calls (a user's `myschema.grad(…)`
+  is left alone), but matched **case-folded** — `GRAD(x, x)` is a marker too. Miss the
+  folding and `GRAD(x,x)` sails through unrewritten to a confusing engine-side
+  "unknown function grad" error. (The pre-gate above folds too.)
+- **Splice by source span, don't reprint the statement (F5) — and mind the span
+  units (G3).** `rewrite_sql` first runs a **parse-free, case-insensitive pre-gate**
+  — `(?i)(grad|jvp|vjp)\s*\(` (G7) — and returns the input **verbatim** if it
+  doesn't hit. This is what makes the byte-identical guarantee real: a marker-free
+  statement is *never parsed*, so sqlparser coverage gaps can't fail or reformat it
+  (§5.3 F5). When the gate hits, it parses and replaces only the marker call's
+  region. **But `sqlparser`'s `Spanned` gives `Location { line, column }` in 1-based
+  *characters*, not byte offsets** (verified: in `SELECT 'héllo', grad(x,x) …` the
+  `grad` is at byte 17 / column 16). So the splice is a small subsystem, not a
+  one-liner: line/column→byte conversion (UTF-8- and multi-line-aware), splice
+  multiple markers in **reverse source order**, rewrite **nested** markers bottom-up
+  on the AST and splice only the outermost span, and fall back safely on empty spans
+  (`Location` documents "Line 0 … for empty spans", so partial `Spanned` coverage is
+  designed-in). The pre-gate may over-match inside string literals — harmless, the
+  real parse decides; never fold the gate into the rewrite. Named M0 task with a
+  multibyte + multi/nested-marker test.
 - **0/1-folding is a stated NULL convention, not an accident (F11).** Folding drops
   structurally-zero terms, so `0 * (NULL expr)` becomes `0` where unfolded SQL would
   give `NULL`. This matches JAX's `Zero`-tangent semantics (a structural zero is a
@@ -386,13 +428,15 @@ every query shape the parser accepts — recursive CTEs, DML, subqueries — whi
 what lets a whole training loop live in one query. xarray-sql and the DuckDB
 extension rely on it.
 
-*Known bound (F5): `sqlparser` is a whole-query gatekeeper.* Path A must parse the
-**entire** statement to locate markers, so applicability is capped by sqlparser's
-per-dialect coverage — not by what `grad` touches. A DuckDB surface sqlparser lags
-on (`SELECT * EXCLUDE`, `PIVOT`, `FROM`-first, next release's syntax…) fails the
-whole `ddx('…')` query even when the `grad` is trivial. DuckDB moves faster than
-sqlparser's `DuckDbDialect`, so this is a standing version-treadmill, named here as
-such. We limit the damage two ways (both v1): a **parse-free pre-gate** returns any
+*Known bound (F5): `sqlparser` is a whole-query gatekeeper.* When a query *does*
+contain a marker, Path A parses the **entire** statement, so applicability is capped
+by sqlparser's per-dialect coverage — not by what `grad` touches. The gaps are
+narrower than earlier drafts claimed (spike, `DuckDbDialect` @ sqlparser 0.62.0,
+G9): `SELECT * EXCLUDE`, `FROM`-first (`FROM t SELECT 1`), bare `FROM t`, lambdas
+(`x -> x+1`), and `t.* REPLACE (…)` **all parse**; the real misses are **`PIVOT`**
+and **`#1` positional columns**. So the treadmill is real (PIVOT proves it) but not
+dire, and it applies *only to marker-bearing queries*. We limit the damage two ways
+(both v1): a **parse-free pre-gate** returns any
 marker-free statement **byte-identical without parsing it at all** (so unsupported
 syntax only fails a query that *actually contains* a marker), and when a marker is
 present the derivative is spliced **by source span** rather than by reprinting the
@@ -406,21 +450,33 @@ v1 for exactly one engine — native Rust DataFusion — because it is the cheap
 possible **validation of the core architectural claim**: that `ddx-core` can drive
 an *in-engine* plan-time rewrite, not just a text preprocess. Both Path-A targets
 exercise only the text path, so without this the "portable rewrite hook" half of
-the thesis (§3.1) would ship unproven — and it de-risks the much harder DuckDB C++
-boundary by exercising the same pattern first, cheaply.
+the thesis (§3.1) would ship unproven. (It does **not** de-risk the DuckDB C++ path
+— G6: that path's hard part, rebuilding a *bound* expression with `ColumnBinding`
+indices and catalog entries, is exactly what the DataFusion bridge *avoids* by
+leaning on DF's unparse/re-plan utilities; the two share only the shallow "walk
+plan, find marker, substitute" pattern. The honest DuckDB de-risker is the
+M3-adjacent spike, §11/§12 Q6.)
 
 Implementation — the **bridge**, not a second rule engine. The rule walks the bound
 `LogicalPlan`, and for each `grad()` `ScalarFunction`:
 
 1. unparse its argument with DataFusion's `expr_to_sql`, which emits a
-   `sqlparser::ast::Expr` — *exactly* `ddx-core`'s input type;
+   `sqlparser::ast::Expr` — *exactly* `ddx-core`'s input type (**iff the versions
+   are pinned identical**, G2; if they ever diverge, the bridge degrades to a
+   string-level round-trip: `Display`-with-parens → DataFusion's own parser — still
+   one rule engine, less elegant);
 2. differentiate via `ddx-core`;
 3. re-plan the resulting `ast::Expr` back to a DataFusion `Expr` against the node's
    schema; replace and recompute the schema.
 
-One rule engine, shared verbatim with Path A. And because the input `Expr` is
-already **bound**, its columns unparse *qualified*, so this path is binding-aware
-for free — the §5.5 ambiguity guard never even fires. We deliberately do **not**
+Two day-one details (G7): (a) `add_analyzer_rule` runs *after* the default analyzer,
+so `TypeCoercion` may already have injected `Cast`s into the marker's argument by the
+time the rule sees it — fine (`Expr::Cast` has a rule) but it changes the symbolic
+form and swells output, and the marker UDF must be coercion-tolerant (variadic-any);
+(b) step 3's re-plan needs a `ContextProvider`/function registry — the seam is
+`SessionState::create_logical_expr`. One rule engine, shared with Path A; and because
+the input `Expr` is already **bound**, its columns unparse *qualified*, so this path
+is binding-aware for free (the §5.5 guard never fires). We deliberately do **not**
 resurrect the prototype's native `differentiate(&Expr)`: that would reintroduce the
 duplicate rule set v0.2 removed, taxing every future rule (§7) twice.
 
@@ -451,8 +507,8 @@ crate (deps: `ddx-core` + `datafusion`) exposes two entry points:
   the SQL *and* DataFrame APIs, via the unparse→`ddx-core`→reparse bridge (§5.3) —
   one rule engine, binding-aware for free. It ships in v1 as the cheapest proof
   that `ddx-core` drives an in-engine rewrite, even though neither acceptance
-  target needs it (xarray-sql is Python → Path A; duckdb-zarr is DuckDB), and it
-  de-risks the harder DuckDB C++ boundary by exercising the same pattern first.
+  target needs it (xarray-sql is Python → Path A; duckdb-zarr is DuckDB). (It does
+  *not* stand in for the DuckDB C++ boundary — G6, §5.3.)
 
 **DuckDB / `ddx` community extension (Rust) → duckdb-zarr.**
 _Settled by spike R1 (2026-07-19)._ Reading DuckDB's actual C Extension API
@@ -639,14 +695,19 @@ and it is the more important half of this section.
   SELECT grad(s * x, x) FROM v       -- ds/dx treated as 0 → result = s = sin(x)
   SELECT grad(sin(x) * x, x) FROM t  -- inlined by hand → cos(x)*x + sin(x)
   ```
-  (Differentiating *w.r.t.* a computed alias — `grad(s*s, s)` — is consistent: `s`
-  is treated as an opaque leaf variable, `d/ds = 2s`; correct if that's what the user
-  means, subject to the engine allowing the alias in scope.) Because `rewrite_sql`
-  sees the whole statement, we add a **best-effort guard**: if a marker argument
-  references an identifier that is a *computed* select-list alias of a CTE/derived
-  table **in the same statement**, error with "differentiate inside the CTE
-  instead." It cannot see catalog views (no schema) — that residual is
+  Because `rewrite_sql` sees the whole statement, we add a **best-effort guard**: if
+  a marker argument references an identifier that is a *computed* select-list alias
+  of a CTE/derived table **in the same statement**, error with "differentiate inside
+  the CTE instead." It cannot see catalog views (no schema) — that residual is
   documentation-only.
+  - **Carve-out — differentiating *w.r.t.* the alias is allowed (G4).** When the
+    computed alias *is* the `wrt` (`grad(s*s, s)`), *every* occurrence of it is the
+    differentiation leaf, so no gradient term can be silently dropped — the F3 danger
+    structurally cannot occur, and `d/ds (s*s) = 2s` is exactly right (subject to the
+    engine allowing the alias in scope). The guard must therefore fire **only when a
+    computed alias appears as a *non-`wrt`* term** in the argument, never when it is
+    the `wrt`. (Without this carve-out the guard would reject `grad(s*s, s)`, a case
+    §5.5/§7.1 endorse — a self-contradiction.)
 
 **Net:** v1 is qualifier-aware syntactic differentiation (needing no binder), plus
 the **projection-boundary contract** (`grad` differentiates the expression as
@@ -722,6 +783,7 @@ the engine actually runs):
 | `SELECT grad(a.v * b.w, a.v) FROM t a JOIN u b …` | `… (b.w) …` | ✅ qualified across joins |
 | `SELECT jvp(sin(x),x,dx), vjp(sin(x),x,w) FROM g` | `(cos(x)*dx)`, `(w*cos(x))` | ✅ forward / cotangent-seeded (not reverse-accum — F10) |
 | `SELECT AVG(grad(loss, theta)) FROM batch` | `AVG( d(loss)/d(theta) )` | ✅ one gradient-descent step (linearity) |
+| `SELECT a+b AS s, grad(s*s, s) FROM t` | `…, (s + s)` | ✅ differentiate w.r.t. a computed alias (G4; `s` is the leaf) |
 | `WITH RECURSIVE n AS (… x-(x*x-2)/grad(x*x-2,x) …) …` | `… /(x+x) …` | ✅ training loop in one query (Path A) |
 | `INSERT INTO p SELECT theta-lr*grad(loss,theta) FROM …` | rewritten SELECT | ✅ DML update rule (Path A) |
 | `SELECT grad(sin(x),x) FROM t` in **DuckDB** | needs `SELECT * FROM ddx('…')` (v1); bare works only in native DataFusion (Path B) | ⚠️ wrapper (§5.4) |
@@ -736,7 +798,7 @@ What it will **refuse** (a clear error, never a wrong number — §4 principle 5
 | `grad(x > 0, x)` / string / date exprs | ❌ `NotImplemented` — not differentiable (permanent) |
 | `grad(a.x * b.x, x)` in a self-join | ❌ hard error — ambiguous unqualified `wrt`; write `a.x` (§5.5 F2) |
 | `grad(x * a.x, a.x)` where bare `x` also binds `a.x` | ❌ hard error — bare `x` may be the `wrt` column; qualify it as `a.x` (§5.5 F2) |
-| `WITH v AS (SELECT sin(x) AS s …) SELECT grad(s*x, x) FROM v` | ❌ error (best-effort) — `s` is a computed CTE alias; differentiate inside the CTE (§5.5 F3) |
+| `WITH v AS (SELECT sin(x) AS s …) SELECT grad(s*x, x) FROM v` | ❌ error (best-effort) — computed CTE alias `s` used as a *non-`wrt`* term; differentiate inside the CTE (§5.5 F3/G4) |
 | `grad(x*y, x+y)` | ❌ error — the `wrt` argument must be a bare column, not an expression |
 | `grad(SUM(f), x)` | ❌ rejected by SQL scoping — `x` is gone after aggregation; write `SUM(grad(f,x))` |
 
@@ -763,11 +825,16 @@ multiplicatively, and an N-parameter gradient is N columns each re-deriving the
 whole loss. This is the classic symbolic-diff blowup; 0/1-folding trims easy zeros
 but does not share subexpressions, so a subexpression appearing k times is
 recomputed per row k times (unless the engine's CSE catches it — partial,
-engine-dependent). And `vjp` (F10) offers no reverse-mode amortization. **v1
-accepts this**, but: (a) M4 adds a **size/latency benchmark** so the cliff is
-measured, not discovered; (b) the post-v1 remedy is a **let-binding pass** that
-factors shared subexpressions into projected columns (`…, cos(x) AS __ddx_t1`) or a
-CTE.
+engine-dependent). And `vjp` (F10) offers no reverse-mode amortization, so the two
+compound (G5): an N-parameter SGD step is N independent full derivations of the loss,
+per row, per iteration — which is precisely why ML abandoned symbolic diff for
+reverse-mode AD (Baydin et al., JMLR 2018). **v1 accepts this and positions around
+it** (low-N scientific calculus is the sweet spot, §1), but: (a) M4 benchmarks
+**swell vs. N** (not just vs. expression size) so the cliff is measured, not
+discovered, and so nothing is promised to duckdb-zarr users past where it holds; (b)
+the post-v1 remedy is a **let-binding pass** that factors shared subexpressions into
+projected columns (`…, cos(x) AS __ddx_t1`) or a CTE. (Reverse-mode proper is a
+larger, later item — see §7/§12 on `vjp`.)
 
 ---
 
@@ -778,9 +845,12 @@ layered and reuses the prototype's:
 
 - **Unit (rule) tests in `ddx-core`** — port the prototype's 15 Rust tests;
   every rule pinned symbolically on `ast::Expr`.
-- **Round-trip property tests** — `parse → differentiate → unparse` produces
-  parseable SQL that re-parses to an equal AST; fuzz small random expression trees
-  per dialect.
+- **Round-trip property tests — semantic, not just "parseable" (G1).** `construct →
+  Display → reparse` must **equal the constructed AST modulo `Nested`** (normalize
+  away parentheses on both sides, then compare). A test that only checks the output
+  *parses*, or compares the reparse to itself, sails right past the precedence bug
+  (`(a+b)*c` → `a + b * c` reparses fine but *wrong*). Fuzz small random trees per
+  dialect; assert the reparsed tree matches the differentiator's tree.
 - **Numeric agreement (the ground truth) — against JAX.** For a battery of
   expressions, compare the engine-evaluated derivative against **`jax.grad`** (and
   `jax.jvp`/`jax.vjp` for those surfaces), which is the natural oracle: the whole
@@ -852,6 +922,25 @@ dependency is quarantined in `ddx-datafusion`. Future crates are physically
 separated so the v1 build stays light. (The `future/` directory is illustrative —
 those may live as un-published workspace members or separate repos.)
 
+**`sqlparser` version policy (G2) — a real cost of the "one IR" choice.** `ddx-core`'s
+public API takes and returns `sqlparser::ast::Expr`, and the Path B bridge (§5.3)
+requires `ddx-core` and DataFusion to resolve the **identical** `sqlparser` 0.x —
+Cargo treats `0.62` and `0.63` as incompatible, so a mismatch makes them two unrelated
+types and the bridge won't compile. `sqlparser` has shipped ~14 breaking 0.x releases
+in ~24 months and DataFusion adopts each with a lag, while §5.3/G9 wants the newest for
+`DuckDbDialect` coverage — the two paths pull the pin in opposite directions. Policy:
+1. **Pin `sqlparser` to DataFusion's requirement** (today `^0.62`). The bridge is a v1
+   deliverable and a broken bridge is a compile failure; the DuckDB-coverage cost is
+   bounded (G9) and the F5 pre-gate limits blast radius.
+2. **Re-export it** — `pub use sqlparser` from `ddx-core` — so downstream consumers
+   can't accidentally link a mismatched version.
+3. **A `sqlparser` bump is a breaking release of `ddx-core`** (standard Rust
+   public-dependency semver). Say so in the changelog policy.
+4. **Degraded mode, if the pins ever must diverge:** the bridge falls back to a
+   string-level round-trip (§5.3) — one rule engine still, less elegant.
+This is the one virtue the deleted `DExpr` had (API insulation from `sqlparser` churn);
+recorded as a trade, not reversed.
+
 ---
 
 ## 10. Naming & distribution
@@ -895,23 +984,30 @@ dependency; the integrations then go in parallel.
 - **M0 — Extract the core.** Create the workspace; lift the prototype's
   `src/autograd.rs` into `ddx-core`, re-pointing the rules from DataFusion `Expr`
   onto `sqlparser::ast::Expr`, and implement `rewrite_sql`. Port the 15 rule unit
-  tests + round-trip tests. **Also lands the §13 correctness/API fixes now, before
-  publish:** (a) the `Ddx` object API (F9); (b) per-dialect identifier folding +
-  case tests (F1); (c) the uncertain-occurrence ambiguity guard (F2); (d) the
-  numeric-type policy in the smart constructors + integer-column tests (F4); (e)
-  decide span-splicing vs. reprint and set the byte-identical-passthrough invariant
-  (F5). *Exit:* `ddx-core` reproduces every prototype rule, rewrites SQL
-  end-to-end, passes the F1/F2/F4 tests, and depends only on `sqlparser`.
+  tests. **Also lands the correctness/API fixes now, before publish:** (a) the `Ddx`
+  object API (F9); (b) per-dialect identifier folding + case tests (F1); (c) the
+  uncertain-occurrence ambiguity guard (F2); (d) the numeric-type policy in the smart
+  constructors + integer-column tests (F4); (e) **precedence-safe construction (F5's
+  sibling, G1): `Nested`-wrapping smart constructors + a `construct→Display→reparse→
+  compare-modulo-Nested` property test** — the one that actually catches the
+  precedence bug; (f) **span→byte splicing (G3): line/column→byte conversion with a
+  multibyte + multi/nested-marker test**, plus the parse-free case-insensitive
+  pre-gate (F5/G7); (g) pin+re-export `sqlparser` (G2). *Exit:* `ddx-core` reproduces
+  every prototype rule, rewrites SQL end-to-end, and **passes the F1/F2/F4/G1/G3
+  tests** — depends only on `sqlparser`.
 - **M1 — Confirm R2** (short). Verify datafusion-python still can't inject an
   `AnalyzerRule` (keeps v1 on the rewrite). *Exit:* v1 path confirmed; any Path B
   seam noted as future-only.
 - **M2 — DataFusion (Python + native Rust).** (a) `ddxdb` wheel: `rewrite_sql` +
   `Context.sql()` shim; re-integrate into xarray-sql, deleting its vendored
   `autograd.rs` in favor of `ddx-core`. (b) `ddx-datafusion`: marker UDFs + the
-  `AnalyzerRule` bridge (unparse→`ddx-core`→reparse), plus the `ddx_sql` helper.
-  *Exit:* xarray-sql green on `ddx-core` (vs JAX, no regressions) **and** bare
-  `grad()` runs end-to-end through the `AnalyzerRule` in a native DataFusion test —
-  the first proof of an in-engine rewrite.
+  `AnalyzerRule` bridge (unparse→`ddx-core`→reparse), plus the `ddx_sql` helper —
+  mind the `TypeCoercion` ordering and `create_logical_expr` seam (G7). **Prereq
+  (G7): pull a *minimal* JAX-oracle numeric-agreement harness forward from M4** —
+  M2's "green vs JAX" gate is unenforceable without it. *Exit:* xarray-sql green on
+  `ddx-core` (vs JAX, no regressions) **and** bare `grad()` runs end-to-end through
+  the `AnalyzerRule` in a native DataFusion test — the first proof of an in-engine
+  rewrite.
 - **M3 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (read SQL
   literal → `rewrite_sql` with `DuckDbDialect` → execute on inner connection →
   stream), plus the `ddxdb` client-side path for DuckDB-python. Integrate with
@@ -982,6 +1078,19 @@ Answers from Alex's review (2026-07-19), folded in:
    *Tripwire:* if the F1/F2 syntactic guards prove messier than expected in M0, that
    shifts the balance toward accelerating the C++ work (the bound path makes those
    guards unnecessary) — decide then, not now.
+7. **Should `vjp` ship in v1? — decided *keep*, against the F10 caveat (G8); your
+   call to overrule.** For the scalar expressions v1 supports, `vjp(e, x, ct)` is
+   definitionally `mul(ct, grad(e, x))` — no reverse accumulation (F10). The cut
+   case (Fable): shipping a function named `vjp` that isn't reverse-mode sets JAX
+   users' expectations and defeats them, and a v1 name is a forever compat surface
+   (the same "social hardening" logic as Q6). The keep case (my recommendation): the
+   jvp/vjp *seeding* symmetry (seed an input tangent vs. an output cotangent) is a
+   real, teachable surface; for scalar output the value it returns is *correct*, and
+   F10 already documents honestly that it doesn't amortize; removing and re-adding is
+   also an API event. **Recommendation: keep `grad`+`jvp`+`vjp`, with the F10 caveat
+   loud in the docs.** Recorded here — per Fable — as a decision made *against* the
+   F10 caveat, not before it. Overrule to `grad`+`jvp`-only if you'd rather not
+   publish `vjp` until it means reverse accumulation.
 
 ---
 
@@ -1231,7 +1340,30 @@ is now explicitly per-dialect. **F5** — the byte-identical guarantee needs a
 vacuous exactly when sqlparser can't parse the statement. And the Fable follow-up on
 C++-vs-`ddx('…')` is folded in at §12 Q6 + §5.4 + M3.
 
----
+### 13.6 Second adversarial round — resolution (G1–G9)
+
+A fresh Fable pass ran four evidence spikes (sqlparser 0.62.0 behavior, DataFusion 54
+pins, crates.io history). **G1 and G3 I re-verified myself** (Rust spike, sqlparser
+0.62.0): constructed `(a+b)*c` Displays as `a + b * c` — wrong — and `Nested`-wrapping
+fixes it; `grad` in `SELECT 'héllo', grad(x,x) …` is at byte 17 / column 16 (columns
+are characters). **Accepted 8 of 9; partial on G8.**
+
+| # | Finding | Resolution | Where |
+| --- | --- | --- | --- |
+| G1 | `Display` drops precedence parens → wrong math (**confirmed**) | Smart constructors `Nested`-wrap composite operands; semantic round-trip test | §5.1, §8, M0 |
+| G2 | `sqlparser` version lockstep undermines "one IR" + the bridge | Pin to DataFusion's `sqlparser`; re-export it; bumps = breaking `ddx-core`; bridge string fallback | §5.1, §5.3, §9 |
+| G3 | Spans are line/column *characters*, not byte ranges (**confirmed**) | Span→byte conversion subsystem; multibyte/multi/nested-marker M0 task | §5.1, M0 |
+| G4 | F3 CTE-alias guard forbade the doc's own `grad(s*s, s)` | Carve-out: fire only when a computed alias is a *non-`wrt`* term | §5.5, §7.1 |
+| G5 | Pitch: headline (training loops) is where limits bite hardest | Invert framing — low-N scientific calculus is the product; training loops a bounded demo | §1, §7.2, M4 |
+| G6 | Contradiction: DF Path B "de-risks" DuckDB C++ (it doesn't) | Deleted the de-risk clause; the M3-adjacent spike is the honest de-risker | §5.3, §5.4 |
+| G7 | Pre-gate/marker case+whitespace; `TypeCoercion` order; oracle-in-M2 | Case-fold gate+marker; named the `create_logical_expr` seam; pulled oracle to M2 | §5.1, §5.3, M2 |
+| G8 | Cut `vjp`? (it's a 2-token macro in v1) | **Partial pushback** — recorded as an explicit decision (keep, w/ F10 caveat), your call | §12 Q7 |
+| G9 | `sqlparser`-gap examples stale (3 of 4 actually parse) | Refreshed to `PIVOT`/`#1`; version-pinned the coverage claim | §5.3 |
+
+The pattern worth keeping: this design is now simple enough that its remaining risks
+live in dependency details (`Display`, `Spanned`, "the same type") — each checkable
+with a 20-line spike before production. Two rounds in, the architecture has not moved
+under attack.
 
 _Next step:_ Alex to review; then iterate this doc (with agents) before we start
 M0. The prototype's `autograd.rs` and its Python test suite are the concrete
