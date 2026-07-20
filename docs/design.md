@@ -68,19 +68,24 @@ This doc is grounded in a working prototype:
 implements `grad`/`jvp`/`vjp` for DataFusion. §3 records what that prototype
 taught us; the rest of the doc generalizes it into a reusable component.
 
-**Sweet spot vs. bounded demo (G5).** The honest framing leads with **calculus as
-columns on tidy scientific/array data** — sensitivity columns, small Jacobians,
-Newton steps, curve fitting, physical derivatives alongside gridded data — which is
-exactly the XQL / xarray-sql / duckdb-zarr audience, and which no other SQL-native
-tool does at all. The in-SQL *training loop* is a genuine and impressive demo, but
-it is **bounded to small models by construction**: this is *symbolic* forward-mode
-differentiation, so an SGD step over N parameters costs N independent full
-derivations of the loss, each re-evaluated per row (F6 swell × F10 no-reverse-mode
-— the two multiply). That compounding is *the* canonical reason ML moved from
-symbolic to reverse-mode AD (Baydin et al., JMLR 2018). So: low-N calculus is the
-product; training loops are the wow, with an explicit small-N caveat (§7.2) — not
-a general autodiff engine (§2). This positioning is what M4's benchmark targets
-(swell vs. *N*, not just vs. expression size).
+**The ambition is "ML in a database," reached in stages (G5).** The destination is
+genuine autograd for training — and it is *reachable in this design*, not abandoned
+(§7.3, de-risked by a verified spike). But it is reached by **growing the scalar
+engine into a second IR scope (reverse-mode AD over queries)**, not by scaling scalar
+`grad`. So the honest staging:
+- **v1 — calculus as columns** (this doc): sensitivity columns, small Jacobians,
+  Newton steps, curve fitting, physical derivatives alongside gridded data — the
+  XQL / xarray-sql / duckdb-zarr sweet spot, which no other SQL-native tool does.
+  *Scalar* `grad` here has a real ceiling: an N-parameter gradient by N scalar
+  derivations doesn't scale (F6 swell × F10 no reverse mode — the two multiply,
+  the canonical reason ML left symbolic diff; Baydin et al., JMLR 2018).
+- **v2 — `vjp` over whole queries** (§7.3): reverse-mode AD where sharing lives in
+  materialized relations (the tape), not inside expressions. This is what earns the
+  ML headline; the scalar engine below becomes its elementwise leaf, intact.
+
+So: don't downplay ML — *stage* it, and be precise that v1 is the primitive layer.
+M4's benchmark measures the scalar ceiling (swell vs. *N*) precisely so the v1/v2
+line is drawn with data, not vibes.
 
 ### 1.1 Success criteria
 
@@ -93,18 +98,22 @@ This is not a toy. The design succeeds when:
   [xarray-sql](https://github.com/xqlsystems/xarray-sql) (DataFusion/Python) and
   [duckdb-zarr](https://github.com/xqlsystems/duckdb-zarr) (Rust community
   extension).
-- The `grad`/`jvp`/`vjp` surface is **portable** — the same SQL-level functions,
-  with one shared `ddx-core` defining what they mean, adopted by every target
-  engine (rather than each reimplementing differentiation). Portability lives at
-  the SQL surface, not in a plan-interchange format (§6).
+- The `grad`/`jvp` surface (scalar; `vjp` reserved for query-level reverse mode,
+  §7.3/§12 Q7) is **portable** — the same SQL-level functions, one shared `ddx-core`
+  defining what they mean, adopted by every target engine rather than each
+  reimplementing differentiation. Portability lives at the SQL surface, not in a
+  plan-interchange format (§6).
 
 ---
 
 ## 2. Non-goals (for the first cut)
 
-- **Not** a runtime tensor library or a replacement for JAX/PyTorch. We
-  differentiate SQL scalar expressions symbolically; we do not implement a tape,
-  GPU kernels, or autodiff of arbitrary imperative UDFs.
+- **Not** a runtime tensor library or a GPU kernel engine, and **not, in v1**, a
+  full reverse-mode AD system. v1 differentiates SQL *scalar expressions*
+  symbolically — no tape, no query-level reverse mode, no autodiff of arbitrary
+  imperative UDFs. (Query-level reverse-mode AD — with materialized relations as the
+  tape — *is* the roadmap destination, §7.3, and is de-risked; it is out of scope for
+  v1, not out of scope for the project.)
 - **Not** general `u^v` power, `CASE`/conditional subgradients, or non-smooth ops
   in v1 (tracked in §7 roadmap). The engine returns a clear `NotImplemented`
   rather than a silently-wrong derivative.
@@ -278,7 +287,8 @@ impl Ddx {
     // Lower-level, on the AST directly (used by the DataFusion AnalyzerRule bridge).
     pub fn differentiate(&self, e: &ast::Expr, wrt: &ColRef) -> Result<ast::Expr, DiffError>;
     pub fn jvp(&self, e: &ast::Expr, seeds: &HashMap<ColRef, ast::Expr>) -> Result<ast::Expr, DiffError>;
-    pub fn vjp(&self, e: &ast::Expr, wrt: &ColRef, cotangent: &ast::Expr) -> Result<ast::Expr, DiffError>;
+    // NB: no scalar `vjp` (§12 Q7) — the `vjp` name is reserved for query-level
+    // reverse-mode AD (§7.3); a scalar cotangent-scaled forward pass earns nothing.
 }
 
 // Column identity read off the AST. Stores sqlparser `Ident`s (which keep
@@ -754,13 +764,11 @@ flag. Not part of v1, and not what defines this project.
 - `grad(expr, column)` → `d(expr)/d(column)`.
 - `jvp(expr, column, tangent)` → forward-mode `d(expr)/d(column) · tangent`.
   Multi-input directional derivative = sum of `jvp` terms.
-- `vjp(expr, column, cotangent)` → `cotangent · d(expr)/d(column)`, the vjp
-  *contraction* for a single input. **Honest caveat (F10):** this is a
-  cotangent-scaled *forward* computation per column, **not** reverse-mode
-  accumulation — there is no shared backward pass, so an N-input gradient still
-  costs N independent differentiations and does not amortize the way JAX's `vjp`
-  does. For a scalar output it numerically coincides with `jvp`; its value is the
-  *seeding surface* (seed a cotangent on the output), not reverse-mode efficiency.
+- ~~`vjp(expr, column, cotangent)`~~ — **not in v1 (F10, §12 Q7).** A scalar `vjp`
+  would be `cotangent · d(expr)/d(column)` — a cotangent-scaled *forward* pass, not
+  reverse accumulation, so it earns nothing over `jvp` for scalar output. The name is
+  **reserved** for the real thing: query-level `ddx.vjp(loss_query, wrt=table)` (§7.3),
+  which does actual reverse-mode AD.
 - `differentiate_sql(expr, wrt)` → derivative as SQL text (the "calculus
   compiler" escape hatch). The prototype's third `columns` argument (§3.3) is
   dropped: it existed only to synthesize a DataFusion schema for standalone
@@ -781,7 +789,7 @@ the engine actually runs):
 | `SELECT grad(x*y,x) AS dfdx, grad(x*y,y) AS dfdy FROM g` | `SELECT y AS dfdx, x AS dfdy FROM g` | ✅ full gradient as tidy columns |
 | `SELECT grad(grad(power(x,3),x),x) FROM g` | `… (6*power(x,1)) …` | ✅ higher-order (nesting) |
 | `SELECT grad(a.v * b.w, a.v) FROM t a JOIN u b …` | `… (b.w) …` | ✅ qualified across joins |
-| `SELECT jvp(sin(x),x,dx), vjp(sin(x),x,w) FROM g` | `(cos(x)*dx)`, `(w*cos(x))` | ✅ forward / cotangent-seeded (not reverse-accum — F10) |
+| `SELECT jvp(sin(x),x,dx) FROM g` | `(cos(x)*dx)` | ✅ forward-mode directional derivative (`vjp` reserved for §7.3 — Q7) |
 | `SELECT AVG(grad(loss, theta)) FROM batch` | `AVG( d(loss)/d(theta) )` | ✅ one gradient-descent step (linearity) |
 | `SELECT a+b AS s, grad(s*s, s) FROM t` | `…, (s + s)` | ✅ differentiate w.r.t. a computed alias (G4; `s` is the leaf) |
 | `WITH RECURSIVE n AS (… x-(x*x-2)/grad(x*x-2,x) …) …` | `… /(x+x) …` | ✅ training loop in one query (Path A) |
@@ -833,8 +841,103 @@ it** (low-N scientific calculus is the sweet spot, §1), but: (a) M4 benchmarks
 **swell vs. N** (not just vs. expression size) so the cliff is measured, not
 discovered, and so nothing is promised to duckdb-zarr users past where it holds; (b)
 the post-v1 remedy is a **let-binding pass** that factors shared subexpressions into
-projected columns (`…, cos(x) AS __ddx_t1`) or a CTE. (Reverse-mode proper is a
-larger, later item — see §7/§12 on `vjp`.)
+projected columns (`…, cos(x) AS __ddx_t1`) or a CTE. (Reverse-mode proper is §7.3.)
+
+### 7.3 The headline destination: query-level reverse-mode AD ("true AD")
+
+The ML pitch (§1) is not something to retreat from — it is a **second IR scope** the
+scalar engine grows into. G5/F6/F10 are real *only for the scalar surface*: they say
+you cannot get an N-parameter gradient by N scalar `grad(loss, wᵢ)` derivations. The
+fix is not to abandon the ML story; it is to **lift differentiation from scalar
+expressions to whole queries** — reverse-mode AD over relational algebra — where the
+sharing that scalar mode lacks happens through *materialized intermediate relations*
+(the tape) instead of inside expressions.
+
+**This is de-risked, not speculative.** The prototype's
+[MNIST-MLP demo (xarray-sql#196)](https://github.com/xqlsystems/xarray-sql/pull/196)
+already trains a 196→32→10 net where every gradient is computed in SQL — a ~160k-param
+model — with `grad` appearing *only* as the elementwise leaf `grad(tanh(z), z)`. Read
+correctly, that backward pass is **reverse-mode AD written by hand**, and I verified
+(spike, `relational_ad_spike.py`) that it is nothing more than the mechanical
+application of a **transpose (VJP) rule per relational primitive**:
+
+| Relational primitive (SQL) | Forward | Transpose / VJP rule | nn.py counterpart |
+| --- | --- | --- | --- |
+| **Contraction** = JOIN + `GROUP BY SUM` | `C[i,k]=Σⱼ A[i,j]·B[j,k]` | `Ā=Σₖ C̄·B` and `B̄=Σᵢ A·C̄` (both contractions) | `delta1`'s inner join; `g2`/`g1`/`g0` |
+| **Elementwise map** | `Y=f(X)` | `X̄ = Ȳ · f′(X)` — and **`f′` is `ddx-core`'s scalar `grad`** | `dc·grad(tanh(z),z)` = `delta1`/`delta0` |
+| **Group-`SUM`** (aggregate) | `S[k]=Σᵢ X[i,k]` | `X̄[i,k]=S̄[k]` (broadcast join) | `gb0`/`gb1`/`gb2` |
+| **Broadcast / bias-add** | `Z=C+b` | `b̄=Σᵢ Z̄` (group-`SUM`) | bias gradients |
+| **softmax + cross-entropy** | log-sum-exp − gather | decomposes: `exp`/`ln` elementwise + group-`SUM` + gather↔scatter | the "hand-derived" `delta2 = softmax−onehot` |
+
+I re-derived **all six** parameter gradients (`W0,b0,W1,b1,W2,b2`) of a 3-layer MLP
+using only these rules and checked them against `jax.grad`: **max error ~1e-18
+(machine-exact)**. The one gradient nn.py wrote "by hand" — the softmax delta — is the
+*first thing* the rules recover mechanically; it was never fundamental.
+
+**Consequences that shape the design:**
+
+- **`ddx-core` v1 is not superseded — it becomes the leaf.** The scalar `grad` is
+  exactly the elementwise-primitive rule (`f′(X)`) in the table above. Everything
+  built in M0–M4 is the foundation of the AD system, not a throwaway.
+- **The right axis is IR *scope*, not "symbolic vs. tape."** JAX is also symbolic
+  (it traces + rewrites a jaxpr); its architecture is *JVP rules for primitives +
+  transpose rules for the linear ones*, with `vjp = transpose(linearize(f))`. Ours is
+  the same recipe, one scope up: primitives are relational operators, the "tape" is
+  materialized intermediate relations, and F3's projection boundary (§5.5) — which
+  *forces* you to keep pre-activations as columns — is literally where the tape lives.
+- **The new machinery is small and bounded:** transpose rules for ~four linear
+  relational operators (contraction, elementwise, per-group `SUM`, `MAX`/argmax
+  routing). The closure property — the transpose of a linear relational operator is
+  again a relational operator — is what makes it automatable.
+- **Generality is now evidenced past the MLP — attention works (spike, 2026-07-20).**
+  `spikes/attention_ad_spike.py` builds a full single-head block (Q/K/V projections →
+  `QKᵀ/√d` → softmax over the *key* axis → `A@V`) from the *same four rules* and matches
+  `jax.grad` on `Wq/Wk/Wv/X` to **~1e-16**; the **causal mask** is just elementwise and
+  also passes (`attention_causal_mask_check.py`). The softmax-over-an-axis VJP composes
+  from elementwise-mul + group-`SUM` + broadcast — no new rule. So the two hardest
+  transformer components are covered; LayerNorm (mean/var = group-`SUM` + elementwise),
+  residuals (elementwise add), and GELU/ReLU (elementwise) reduce to the same set.
+- **Published precedent (reviewed):** Tang et al., *Auto-Differentiation of Relational
+  Computations for Very Large Scale Machine Learning* (ICML 2023, PMLR 202:33581) does
+  exactly this — a functional relational algebra (TableScan/Selection/Aggregation/Join
+  as higher-order functions) with a gradient operator `∇` and **per-operator
+  relation-Jacobian (VJP) products** for reverse mode. It maps 1:1 to our four
+  primitives (Join≈contraction, Aggregation≈group-`SUM`, Selection-with-kernel
+  ≈elementwise, TableScan≈leaf), and demonstrates the approach is not just feasible but
+  **performance-competitive at scale** (billion-node graph conv, distributed, via the
+  DB optimizer choosing data/model parallelism). Two takeaways for `ddx`:
+  - *What `ddx` adds that they don't:* they target a **bespoke tensor-relational
+    engine**, not portable/standard SQL, and don't factor out a reusable scalar-AST
+    symbolic differentiator. `ddx`'s contribution is the **engine-portable, SQL-surface,
+    community-installable** form with `ddx-core` as the reusable elementwise leaf.
+  - *Key perf design decision:* their values are **chunked tensors** (a relation stores
+    sub-matrix *blocks*, not one scalar per cell), so the join kernel `⊗` is a real
+    **BLAS matmul on blocks**. That — not only sparsity — is the answer to the
+    "join-as-matmul vs. BLAS" ceiling below. `ddx`'s v2 should store chunked values.
+
+**Staging (roadmap, not a rewrite) — and Alex wants this pulled *earlier*, not
+parked in "future":**
+
+- **v1 — calculus as columns.** The scalar surface (`grad`/`jvp`) and §§5–11. This *is*
+  the primitive layer; nothing here is throwaway.
+- **v1.5 — relational-backprop reference (start in parallel with v1).** Clean up nn.py
+  into the canonical example + regression fixture (the spike shows the rules reproduce
+  it exactly); write the four transpose rules formally against Tang et al.'s formulation.
+- **v2 — `vjp` over queries: "differentiate queries, not expressions."**
+  `ddx.vjp(loss_query, wrt = weight_table)` emits the backward query program (the
+  `delta*`/`g*` relations), tape = materialized intermediates (chunked). This earns the
+  "ML in a database" headline. Per Alex's strong preference, v2 is a **committed track**,
+  not demand-driven "future" — the MLP + attention spikes have retired most of the risk;
+  the remaining items are engineering (chunked storage, the emitter, `MAX`/argmax
+  routing, LayerNorm) rather than open questions.
+
+**Honest limits to carry forward:** join-as-matmul has a ceiling vs. BLAS on *dense*
+scalar-per-cell data — countered two ways: **chunked tensor values** (BLAS on blocks,
+per Tang et al.) and native **sparsity** (the demo's `WHERE images <> 0` gave a measured
+~1.8× on Fashion-MNIST, free). And the demo's training loop is Python-orchestrated with
+`.cache()` as the tape — so "whole loop in one recursive CTE" does not survive real
+models; the doc stops leading with that claim (§7.1's recursive-CTE row is a *small*-loop
+demo, not the ML path). Full verification lives in [`spikes/`](../spikes/).
 
 ---
 
@@ -1029,6 +1132,15 @@ dependency; the integrations then go in parallel.
   vs. JAX, dialect canonicalization table, docs. **Plus (F6/F11/F12):** the
   expression-swell size/latency **benchmark** (§7.2), and the convention-pinning
   tests for NULL-folding, kinks, and domain edges (§8).
+- **v1.5 — relational-backprop reference (parallel with v1).** Clean up the
+  xarray-sql#196 MLP into the canonical example / regression fixture (the v2 emitter's
+  compilation target, §7.3); formalize the four transpose rules against Tang et al.
+- **v2 — query-level reverse-mode AD (the ML headline) — committed track, not "future."**
+  `ddx.vjp(query, wrt=table)` emitting a backward query program over chunked-tensor
+  relations (§7.3). The generality de-risk is **done**: MLP *and* attention (incl.
+  causal mask) reproduce `jax.grad` machine-exact from the four rules ([`spikes/`](../spikes/),
+  §13.6). Remaining is engineering — chunked storage (BLAS on blocks), the emitter,
+  `MAX`/argmax routing, LayerNorm — not open research.
 - **Future (post-v1, demand-driven):** the C++/cxx.rs hybrid for bare `grad()` in
   DuckDB (§5.4 opt 4) and `ddx-pg` (Postgres).
 
@@ -1078,19 +1190,17 @@ Answers from Alex's review (2026-07-19), folded in:
    *Tripwire:* if the F1/F2 syntactic guards prove messier than expected in M0, that
    shifts the balance toward accelerating the C++ work (the bound path makes those
    guards unnecessary) — decide then, not now.
-7. **Should `vjp` ship in v1? — decided *keep*, against the F10 caveat (G8); your
-   call to overrule.** For the scalar expressions v1 supports, `vjp(e, x, ct)` is
-   definitionally `mul(ct, grad(e, x))` — no reverse accumulation (F10). The cut
-   case (Fable): shipping a function named `vjp` that isn't reverse-mode sets JAX
-   users' expectations and defeats them, and a v1 name is a forever compat surface
-   (the same "social hardening" logic as Q6). The keep case (my recommendation): the
-   jvp/vjp *seeding* symmetry (seed an input tangent vs. an output cotangent) is a
-   real, teachable surface; for scalar output the value it returns is *correct*, and
-   F10 already documents honestly that it doesn't amortize; removing and re-adding is
-   also an API event. **Recommendation: keep `grad`+`jvp`+`vjp`, with the F10 caveat
-   loud in the docs.** Recorded here — per Fable — as a decision made *against* the
-   F10 caveat, not before it. Overrule to `grad`+`jvp`-only if you'd rather not
-   publish `vjp` until it means reverse accumulation.
+7. **`vjp` — RESOLVED by the §7.3 spike: reserve the name; v1 ships `grad` + `jvp`.**
+   The earlier draft leaned "keep scalar `vjp`." The true-AD spike changes the answer:
+   the **real** `vjp` is the query-level one — `ddx.vjp(loss_query, wrt=table)` doing
+   actual reverse accumulation (§7.3) — and it is now visibly on the roadmap. Shipping
+   a *scalar* `vjp` that is definitionally `mul(ct, grad(e,x))` (no accumulation, F10)
+   would burn that name on a two-token macro and mislead the exact JAX audience the
+   project courts — and a v1 name is a forever compat surface (the Q6 "social
+   hardening" logic). So **cut scalar `vjp` from v1**; ship `grad` + `jvp` (jvp is the
+   honest forward-mode primitive and composes), and keep `vjp` for the operation that
+   earns it. *If* a scalar cotangent-seeding surface is ever wanted before v2, name it
+   something that isn't `vjp`.
 
 ---
 
@@ -1354,16 +1464,40 @@ are characters). **Accepted 8 of 9; partial on G8.**
 | G2 | `sqlparser` version lockstep undermines "one IR" + the bridge | Pin to DataFusion's `sqlparser`; re-export it; bumps = breaking `ddx-core`; bridge string fallback | §5.1, §5.3, §9 |
 | G3 | Spans are line/column *characters*, not byte ranges (**confirmed**) | Span→byte conversion subsystem; multibyte/multi/nested-marker M0 task | §5.1, M0 |
 | G4 | F3 CTE-alias guard forbade the doc's own `grad(s*s, s)` | Carve-out: fire only when a computed alias is a *non-`wrt`* term | §5.5, §7.1 |
-| G5 | Pitch: headline (training loops) is where limits bite hardest | Invert framing — low-N scientific calculus is the product; training loops a bounded demo | §1, §7.2, M4 |
+| G5 | Pitch: headline (training loops) is where limits bite hardest | **Stage, don't retreat** — v1 = calculus-as-columns (primitive layer); v2 = query-level reverse-mode AD (§7.3), de-risked by a verified spike; ML is the destination | §1, §2, §7.3, M4 |
 | G6 | Contradiction: DF Path B "de-risks" DuckDB C++ (it doesn't) | Deleted the de-risk clause; the M3-adjacent spike is the honest de-risker | §5.3, §5.4 |
 | G7 | Pre-gate/marker case+whitespace; `TypeCoercion` order; oracle-in-M2 | Case-fold gate+marker; named the `create_logical_expr` seam; pulled oracle to M2 | §5.1, §5.3, M2 |
-| G8 | Cut `vjp`? (it's a 2-token macro in v1) | **Partial pushback** — recorded as an explicit decision (keep, w/ F10 caveat), your call | §12 Q7 |
+| G8 | Cut `vjp`? (it's a 2-token macro in v1) | **Resolved by the §7.3 spike — CUT.** Reserve `vjp` for query-level reverse mode; v1 ships `grad` + `jvp` | §5.1, §7, §7.1, §12 Q7 |
 | G9 | `sqlparser`-gap examples stale (3 of 4 actually parse) | Refreshed to `PIVOT`/`#1`; version-pinned the coverage claim | §5.3 |
 
 The pattern worth keeping: this design is now simple enough that its remaining risks
 live in dependency details (`Display`, `Spanned`, "the same type") — each checkable
 with a 20-line spike before production. Two rounds in, the architecture has not moved
 under attack.
+
+**G5 follow-through — the true-AD de-risk (2026-07-20).** Alex was not comfortable
+retreating from the ML headline, so we ran the spike G5's own analysis implied
+(`relational_ad_spike.py`): mechanically re-derive xarray-sql#196's hand-written
+MLP backward pass from transpose rules for four relational primitives, and check
+against `jax.grad`. **Result: all six parameter gradients machine-exact (~1e-18), and
+every rule-derived relation equals one of nn.py's `delta*`/`g*` queries** — including
+the "hand-derived" softmax delta, which the rules recover mechanically. Conclusion:
+query-level reverse-mode AD ("true AD") is an **engineering project, not research**,
+and the scalar engine survives as its elementwise leaf. That turns G5 from "downplay
+ML" into "**stage** ML" (§7.3 is the new roadmap) and resolves G8 (cut scalar `vjp`,
+reserve the name). This is the one place the reviews *added* scope rather than trimming
+it — because the evidence said the ambition is reachable.
+
+**Generality + paper review (2026-07-20).** Two follow-ups tightened it. (1) Attention:
+`spikes/attention_ad_spike.py` reproduces `jax.grad` for a full single-head block (+
+causal mask) from the same four rules, machine-exact — retiring "does it generalize past
+the MLP?" (2) Tang et al. (ICML 2023) reviewed: same method (per-operator
+relation-Jacobian products over a functional RA), peer-reviewed and shown
+performance-competitive at billion-scale. So the direction is validated; `ddx`'s
+differentiator is the portable / SQL-surface / installable form + reusable scalar leaf,
+and the perf answer to "join vs. BLAS" is **chunked-tensor values** (blocks, not
+scalar-per-cell). Per Alex's preference, v2 (true AD) is now a **committed track**
+(§7.3, §11), not demand-driven future.
 
 _Next step:_ Alex to review; then iterate this doc (with agents) before we start
 M0. The prototype's `autograd.rs` and its Python test suite are the concrete
