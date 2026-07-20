@@ -1,4 +1,4 @@
-# Design Doc: `ddx` — portable autograd for composable databases
+# `ddx` — portable autograd for composable databases
 
 _author_: Alex Merose
 
