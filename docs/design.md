@@ -261,8 +261,8 @@ impl Ddx {
 }
 
 // Column identity read off the AST. Stores sqlparser `Ident`s (which keep
-// quote-style), and is compared with per-dialect identifier folding (F1), not
-// raw-string equality: casefold unquoted parts, exact-match quoted ones.
+// quote-style), and is compared with *per-dialect* identifier folding (F1), not
+// raw-string equality — the folding rule is dialect-specific (see the F1 note).
 pub struct ColRef { pub qualifier: Option<Ident>, pub name: Ident }
 ```
 
@@ -285,7 +285,7 @@ Design notes:
   (Binary/n-ary custom rules are a richer trait, likely post-v1.) A small
   canonicalization table folds dialect spellings (`ln`/`log`, `pow`/`power`) to one
   canonical name before dispatch.
-- **Smart constructors own the numeric-type policy (F1b/F4).** `add/sub/mul/div/neg/
+- **Smart constructors own the numeric-type policy (R1b/F4).** `add/sub/mul/div/neg/
   square` do the `Zero`/`add_tangents` 0/1-folding *and* enforce floating-point
   arithmetic — because differentiation runs *pre-binding*, operand types are always
   unknown, and SQL integer `/` truncates on some engines (DataFusion: `grad(x/y,y)`
@@ -294,27 +294,39 @@ Design notes:
   hit integer inputs) wraps in `CAST(… AS DOUBLE)`, and literals are emitted
   `DOUBLE`-typed (DuckDB otherwise types `0.0` as `DECIMAL`). Slightly noisier
   output, correct on every engine. Pin with an integer-column test in M0.
-- **Identifier folding, not raw-string equality (F1).** SQL unquoted identifiers
-  are case-insensitive (DuckDB throughout; DataFusion lowercases unquoted at
-  planning). `ColRef` comparison must casefold unquoted parts and exact-match
-  quoted ones, per dialect — otherwise `grad(Temp*Temp, temp)` silently yields
-  derivative `0`. (The prototype got this free by routing through DataFusion's
-  `parse_sql_expr`; the sqlparser-only core must do it explicitly — a
-  regression risk for the M2 "no regressions" gate.) Output preserves original
-  spelling.
-- **Qualifier-aware, with a *symmetric* ambiguity guard (§5.5, F2).** `ColRef`
-  carries the qualifier from `CompoundIdentifier`. If the `wrt` base name appears
-  under **mixed qualification** anywhere in the argument (bare + qualified, or ≥2
-  qualifiers) — regardless of whether `wrt` itself is qualified — it is a hard
-  error demanding full qualification. AST-only, no catalog (§5.5).
+- **Identifier folding, not raw-string equality (F1) — and the fold is
+  *per-dialect*.** SQL unquoted identifiers are case-insensitive, so
+  `grad(Temp*Temp, temp)` must match — otherwise it silently yields derivative `0`.
+  But the exact rule differs by engine and **is not simply "casefold unquoted,
+  exact-match quoted":**
+  - **DataFusion / Postgres-style:** unquoted fold to lowercase; **quoted are
+    case-sensitive** (`"Temp"` ≠ `"temp"`).
+  - **DuckDB:** case-insensitive **throughout** — even *quoted* identifiers match
+    case-insensitively (case is preserved for display only), so `"Temp"` = `"temp"`.
+    Exact-matching quoted parts here would reintroduce the silent mismatch.
+
+  So `ColRef` equality takes the dialect and applies its rule to each part. (The
+  prototype got folding free via DataFusion's `parse_sql_expr`; the sqlparser-only
+  core must do it explicitly — a regression risk for the M2 "no regressions" gate.)
+  Output preserves original spelling.
+- **Qualifier-aware, with an ambiguity guard on *uncertain* occurrences (§5.5, F2).**
+  `ColRef` carries the qualifier from `CompoundIdentifier`. Hard-error only when an
+  occurrence of the `wrt` base name can't be pinned syntactically — a *bare*
+  occurrence when `wrt` is qualified, or a qualified occurrence when `wrt` is bare.
+  A fully-qualified, unambiguous `wrt` like `grad(a.x*b.x, a.x)` is **accepted**.
+  AST-only, no catalog (§5.5).
 - **Reserve the marker names precisely (F8).** `grad`/`jvp`/`vjp` are claimed only
   as **unqualified** function calls; a user's `myschema.grad(…)` is left alone.
   Document the reservation.
-- **Splice by source span, don't reprint the statement (F5).** `rewrite_sql`
-  replaces only the marker call's byte range (via sqlparser's `Spanned`), leaving
-  every other byte — comments, formatting, unsupported-but-untouched syntax —
-  identical; a marker-free statement is returned verbatim. This caps the blast
-  radius (§5.3 F5) and avoids canonical-form drift. (Confirm span coverage for the
+- **Splice by source span, don't reprint the statement (F5).** `rewrite_sql` first
+  runs a **parse-free pre-gate** — a cheap substring/regex scan for `grad`/`jvp`/
+  `vjp(` — and returns the input **verbatim** if none is present. This is what makes
+  the byte-identical guarantee real: a marker-free statement is *never parsed*, so
+  it can't be failed or reformatted by sqlparser's coverage gaps (§5.3 F5). Only
+  when the gate hits does it parse, and then it replaces just the marker call's byte
+  range (via sqlparser's `Spanned`), leaving every other byte identical. (The gate
+  can over-match inside string literals — harmless, since the subsequent real parse
+  decides; never fold the gate into the rewrite. Confirm `Spanned` coverage for the
   pinned sqlparser in M0.)
 - **0/1-folding is a stated NULL convention, not an accident (F11).** Folding drops
   structurally-zero terms, so `0 * (NULL expr)` becomes `0` where unfolded SQL would
@@ -380,10 +392,12 @@ per-dialect coverage — not by what `grad` touches. A DuckDB surface sqlparser 
 on (`SELECT * EXCLUDE`, `PIVOT`, `FROM`-first, next release's syntax…) fails the
 whole `ddx('…')` query even when the `grad` is trivial. DuckDB moves faster than
 sqlparser's `DuckDbDialect`, so this is a standing version-treadmill, named here as
-such. We limit the damage two ways (both v1): a marker-free statement passes through
-**byte-identical** (never reprint what we don't change), and markers are replaced
-**by source span** rather than by reprinting the statement (§5.1, F5) — so parsing
-coverage is the only hard bound, and reprint fidelity is not a separate risk.
+such. We limit the damage two ways (both v1): a **parse-free pre-gate** returns any
+marker-free statement **byte-identical without parsing it at all** (so unsupported
+syntax only fails a query that *actually contains* a marker), and when a marker is
+present the derivative is spliced **by source span** rather than by reprinting the
+statement (§5.1, F5) — so parse coverage bounds only marker-bearing queries, and
+reprint fidelity is not a separate risk.
 
 **Path B — in-engine plan rewrite, shipped for native DataFusion in v1.** A marker
 UDF + `AnalyzerRule` so `grad()` works bare, with no wrapper (`SELECT grad(sin(x),
@@ -454,8 +468,11 @@ table functions + a replacement scan and nothing deeper.
 symbolic argument tree — insufficient for differentiation (§3.1). The ranked
 options that remain:
 
-  1. **In-extension Path A via a table function (recommended primary).** The same
-     header exposes `duckdb_bind_get_parameter` (read a **literal SQL string at
+  1. **In-extension Path A via a table function (recommended primary — but
+     *transitional*).** Brand it, in both this doc and the extension's own docs, as
+     "the portable form until bare `grad()` lands," so it never hardens into a
+     compatibility contract (its real risk is social, not technical — §12 Q6). The
+     same header exposes `duckdb_bind_get_parameter` (read a **literal SQL string at
      bind time**) and `duckdb_connect` + `duckdb_query` (**execute a query from
      inside the extension**). So a `ddx('<sql>')` table function reads the query
      literal, rewrites markers via `ddx-core::rewrite_sql` (with `DuckDbDialect`),
@@ -478,11 +495,16 @@ options that remain:
        statements are invisible** inside `ddx('…')` (R1b covered only transaction
        visibility; this is broader and more common). Folds into the "when to use
        client-side Path A" guidance below.
-     - **DML policy — decide on purpose.** DuckDB's own built-in `query('sql')`
-       table function is deliberately **SELECT-only**; R1b showed inner DML *works*,
-       but community-extension review may object and the client-side path already
-       covers stateful loops. Default: restrict `ddx('…')` to read/SELECT shapes,
-       route DML training loops through client-side Path A.
+     - **DML policy — decide on purpose.** DuckDB *does* ship a built-in
+       `query('sql')` table function (a shape precedent), but — correcting an
+       earlier claim here — it is **not** SELECT-only: its docs warn it runs
+       *arbitrary* queries and can alter database state, and it accepts **only a
+       literal string** argument ([DuckDB docs](https://duckdb.org/docs/stable/guides/sql_features/query_and_query_table_functions)).
+       So precedent neither forces SELECT-only nor offers a constant-folding
+       shortcut. R1b showed inner DML *works*; we still default `ddx('…')` to
+       **read/SELECT-only**, but on our *own* grounds — re-entrancy caution and
+       community-review conservatism — and route DML loops through client-side
+       Path A.
      - **Ergonomics.** SQL-in-a-string quoting is unpleasant for the flagship
        recursive-CTE examples; document **dollar-quoting** — `ddx($$ … $$)` — as the
        house style.
@@ -494,8 +516,14 @@ options that remain:
      rewritten SQL themselves.
   4. **A hybrid C++/Rust extension via an `OptimizerExtension` (stretch goal;
      spiked 2026-07-19).** The *only* route to bare `grad()` anywhere in a normal
-     SELECT — and, as a bonus, it is **binding-aware for free** (§5.5), since the
-     optimizer runs *after* binding. Architecture: the DuckDB **C++
+     SELECT — and its advantage is **structural, not cosmetic**: running *after
+     binding*, it is immune to the entire silent-wrong class Path A must guard
+     against syntactically. Columns arrive as resolved bindings, so **F1**
+     (identifier case), **F2/F3** (qualification ambiguity, projection boundaries)
+     simply cannot arise, and **F5** (sqlparser as whole-query gatekeeper)
+     disappears because DuckDB parses the query and only the marker's expression
+     crosses to Rust. That is the real long-term case for it (§12 Q6). Architecture:
+     the DuckDB **C++
      [extension-template](https://github.com/duckdb/extension-template)** (CMake +
      vcpkg + DuckDB submodule) registers an `OptimizerExtension` whose
      `optimize_function` walks the bound `LogicalOperator` plan, finds each `grad`
@@ -506,30 +534,32 @@ options that remain:
      extensions (`INSTALL ddx FROM community;`) like any C++ extension.
 
      _Spike verdict:_ **cxx.rs is the right FFI tool and makes the Rust↔C++ call
-     itself trivial — but it does not remove the two real costs, so this stays
-     post-v1.** (a) A C++ extension links DuckDB *internals* and must be rebuilt
-     per DuckDB version against an unstable internal API (heavier build + CI than
-     the stable C API). (b) **The hard part is the expression boundary, which cxx
-     does not solve:** at the optimizer stage columns are bound *structurally by
-     index* (`ColumnBinding`), so a bound `Expression` does **not** round-trip to
-     re-parseable SQL — the SQL-text boundary we use elsewhere is unavailable here.
-     The boundary must carry the expression *structurally*: either (i) serialize
-     DuckDB's expression to bytes and write a Rust deserializer into `ddx-core`'s
-     `sqlparser::ast::Expr` (clean, but couples to DuckDB's internal serialization
-     format), or
-     (ii) expose the C++ `Expression` tree to Rust as cxx opaque types with
-     accessors and rebuild a bound expression from Rust (most code, tight version
-     coupling). (i) is the likely first cut. `autocxx` (auto-binding DuckDB's
-     headers) is tempting but DuckDB's headers are large/complex — prefer a narrow
-     hand-written cxx bridge.
+     itself trivial — but it does not remove the real cost, so this stays
+     post-v1.** (a) A C++ extension links DuckDB *internals* and is rebuilt per
+     DuckDB version against an unstable internal API — though this tax is *partly
+     absorbed* by the community-extensions CI, which already rebuilds C++ extensions
+     each release (so it's lighter than earlier drafts implied; most community
+     extensions live here). (b) **The hard part is the expression boundary, which
+     cxx does not solve — and it is bidirectional:** at the optimizer stage columns
+     are bound *structurally by index* (`ColumnBinding`), so a bound `Expression`
+     does **not** round-trip to re-parseable SQL. Getting the argument *out* to
+     `ddx-core`'s `ast::Expr` (serialize DuckDB's expression → Rust deserializer) is
+     the easy direction; **rebuilding a *bound* derivative expression on the way
+     back — with correct `ColumnBinding` indices and catalog function entries for
+     `cos`, `power`, … — is the gnarly part** (the 20% that is 80% of the work, and
+     DuckDB-version-coupled forever). Its miniature is exactly the M3-adjacent spike
+     in §12 Q6. `autocxx` (auto-binding DuckDB's headers) is tempting but the headers
+     are large/complex — prefer a narrow hand-written cxx bridge.
   5. **`CREATE MACRO`** — rejected: macros are fixed expansions and cannot perform
      general differentiation.
 
-Plan: ship (1) as the Rust community extension for duckdb-zarr, with (2) as the
-Python-side convenience. Keep (4) — the cxx.rs hybrid — as the documented route to
-bare `grad()` + binding-aware DuckDB, revisited when bare `grad()` is prioritized;
-its cost is the C++/internals build and the structural expression boundary, not
-the FFI.
+Plan: ship (1) as the Rust community extension for duckdb-zarr (**branded
+transitional**), with (2) as the Python-side convenience. Keep (4) — the cxx.rs
+hybrid — as the documented, correctness-superior route to bare `grad()`, revisited
+when prioritized. **Don't build (4) up front** (§12 Q6), but **pull its risk
+forward** with a miniature spike (round-trip one `BoundFunctionExpression` through
+`ddx-core` and back), so the full extension becomes a known quantity schedulable on
+demand rather than a multi-week unknown.
 
 > **R1b — RESOLVED (2026-07-19, spike).** Tested DuckDB 1.5.4's behavior when a
 > query runs on a second connection to the same database *during* execution of an
@@ -563,32 +593,36 @@ the FFI.
 **Postgres / `ddx-pg` (`pgrx`) — later.** Needs array/XQL support first; native
 Path B would use a planner hook. Out of scope for v1.
 
-### 5.5 Column identity: qualifier-aware is binding-correct
+### 5.5 Column identity and the projection boundary
 
-The earlier draft worried that a *syntactic* (pre-binding) rewrite forces
-*unqualified* column names and can't tell `a.x` from `b.x`. Working it through, the
-concern mostly dissolves — and the fix is small:
+Two things a pre-binding syntactic rewrite has to get right about columns. The
+first — telling `a.x` from `b.x` — mostly dissolves with a small guard. The second
+— that `grad` treats any *upstream-computed* column as a constant (F3) — does
+**not** dissolve; it is a real semantic contract that lands on the pitched use case,
+and it is the more important half of this section.
 
 - **`ColRef` reads the qualifier straight off the AST.** `sqlparser` parses `a.x`
   as a `CompoundIdentifier`, so `ColRef { qualifier: Some("a"), name: "x" }` falls
   out for free. `grad(a.x + b.x, a.x)` differentiates the right column with no
   catalog. This is strictly better than the prototype's unqualified-only form.
-- **Binding-correct given a *symmetric* ambiguity guard (F2).** Matching by `ColRef`
-  (with identifier folding, §5.1 F1) picks the column the engine would bind —
-  *provided* the differentiation variable's base name is used consistently in the
-  argument. It can fail in **both** directions, so the guard must be symmetric:
-  - unqualified `wrt`, base name under ≥2 qualifiers — `grad(a.x * b.x, x)` in a
-    self-join `FROM t a JOIN t b`: "which `x`?";
-  - **qualified `wrt`, same base name also appearing bare** — `grad(x * a.x, a.x)`
-    where only `t` has `x`, so the engine binds bare `x` to `a.x` and the answer is
-    `2x`; but syntactic matching treats bare `x` as a *different* (constant) leaf and
-    returns `x`. A wrong number whose emitted SQL is perfectly bindable, so nothing
-    fails downstream.
+- **Binding-correct given a guard keyed on *uncertain* occurrences (F2).** Match by
+  `ColRef` (with identifier folding, §5.1 F1). The danger is an occurrence of the
+  `wrt`'s base name whose binding we can't pin syntactically — and which occurrences
+  those are depends on how `wrt` is written:
+  - **Qualified `wrt`** (`a.x`): safe *unless a bare occurrence of the base name*
+    (`x`) also appears in the argument — a bare `x` might bind to `a.x`, so treating
+    it as a constant leaf could be silently wrong (`grad(x * a.x, a.x)` should be
+    `2x`; naive matching gives `x`, a wrong number whose SQL still binds). But an
+    occurrence under a *different* qualifier (`b.x`) is an unambiguously distinct
+    column and is fine — so **`grad(a.x * b.x, a.x)` → `b.x` is accepted** (exactly
+    the form §7.1 recommends; the guard must not reject it).
+  - **Unqualified `wrt`** (`x`): safe only if *every* occurrence of the base name in
+    the argument is also bare. If the base name appears qualified, or under ≥2
+    qualifiers, we can't tell which column `x` means (`grad(a.x * b.x, x)`).
 
-  So: if the `wrt` base name appears with **mixed qualification** anywhere in the
-  argument (bare + qualified, or ≥2 qualifiers) — *regardless of whether `wrt` itself
-  is qualified* — hard-error and demand full qualification. AST-only, no catalog,
-  same cost as the one-sided version. Keeps "fail loud, never silently wrong" (§4.5).
+  When it fires, hard-error and demand full qualification. AST-only, no catalog.
+  Keeps "fail loud, never silently wrong" (§4.5) *without* rejecting a
+  fully-qualified, unambiguous `wrt`.
 - **Wholly-unqualified ambiguity fails loud downstream.** `grad(sin(x), x)` with `x`
   in two joined tables emits SQL that still contains bare `x`, which the engine
   rejects as ambiguous. Catalog-driven **Path B** *resolves* these (and `SELECT *`
@@ -614,11 +648,13 @@ concern mostly dissolves — and the fix is small:
   instead." It cannot see catalog views (no schema) — that residual is
   documentation-only.
 
-**Net:** v1 is qualifier-aware syntactic differentiation — which honors "don't be
-limited to unqualified names" while needing no binder. This is a deliberate,
-partial revision of the earlier "invest fully in binding awareness now" decision:
-the fully-bound path rides along with Path B rather than blocking v1. Open
-sub-question in §12 Q2.
+**Net:** v1 is qualifier-aware syntactic differentiation (needing no binder), plus
+the **projection-boundary contract** (`grad` differentiates the expression as
+written, treating upstream-computed columns as constants — F3). This honors "don't
+be limited to unqualified names" while being honest that factoring through a CTE
+drops gradient terms. The fully-bound path (which would erase both the
+qualification guard *and* the projection-boundary caveat — §5.4 opt 4, §12 Q6)
+rides along with Path B rather than blocking v1. Open sub-question in §12 Q2.
 
 ---
 
@@ -699,7 +735,7 @@ What it will **refuse** (a clear error, never a wrong number — §4 principle 5
 | `grad(CASE WHEN x>0 THEN x END, x)` | ❌ `NotImplemented` — conditionals not yet (roadmap) |
 | `grad(x > 0, x)` / string / date exprs | ❌ `NotImplemented` — not differentiable (permanent) |
 | `grad(a.x * b.x, x)` in a self-join | ❌ hard error — ambiguous unqualified `wrt`; write `a.x` (§5.5 F2) |
-| `grad(x * a.x, a.x)` where bare `x` also binds `a.x` | ❌ hard error — mixed qualification of `x`; qualify it (§5.5 F2) |
+| `grad(x * a.x, a.x)` where bare `x` also binds `a.x` | ❌ hard error — bare `x` may be the `wrt` column; qualify it as `a.x` (§5.5 F2) |
 | `WITH v AS (SELECT sin(x) AS s …) SELECT grad(s*x, x) FROM v` | ❌ error (best-effort) — `s` is a computed CTE alias; differentiate inside the CTE (§5.5 F3) |
 | `grad(x*y, x+y)` | ❌ error — the `wrt` argument must be a bare column, not an expression |
 | `grad(SUM(f), x)` | ❌ rejected by SQL scoping — `x` is gone after aggregation; write `SUM(grad(f,x))` |
@@ -861,7 +897,7 @@ dependency; the integrations then go in parallel.
   onto `sqlparser::ast::Expr`, and implement `rewrite_sql`. Port the 15 rule unit
   tests + round-trip tests. **Also lands the §13 correctness/API fixes now, before
   publish:** (a) the `Ddx` object API (F9); (b) per-dialect identifier folding +
-  case tests (F1); (c) the symmetric mixed-qualification guard (F2); (d) the
+  case tests (F1); (c) the uncertain-occurrence ambiguity guard (F2); (d) the
   numeric-type policy in the smart constructors + integer-column tests (F4); (e)
   decide span-splicing vs. reprint and set the byte-identical-passthrough invariant
   (F5). *Exit:* `ddx-core` reproduces every prototype rule, rewrites SQL
@@ -882,9 +918,17 @@ dependency; the integrations then go in parallel.
   duckdb-zarr; run the R1b Rust-extension smoke test. **Named tasks, not
   discoveries (F7):** the bind-time-schema spike (declare result columns by
   `DESCRIBE`-ing the rewritten query on the inner connection) and the DML policy
-  decision (SELECT-only by default). *Exit:* `grad` works end-to-end via `SELECT *
-  FROM ddx('…')` on a real duckdb-zarr dataset, with the schema/DML behavior
-  documented.
+  decision (SELECT-only by default). Also brand the extension **transitional** in
+  its docs. *Exit:* `grad` works end-to-end via `SELECT * FROM ddx('…')` on a real
+  duckdb-zarr dataset, with the schema/DML behavior documented.
+- **M3-adjacent spike (de-risks §5.4 opt 4; schedule with M3, not after).** The
+  miniature of the whole C++ hybrid: from an `OptimizerExtension`, serialize **one**
+  `grad` `BoundFunctionExpression` out to `ddx-core`, differentiate, and **rebuild
+  one bound derivative expression back in** — correct `ColumnBinding` indices,
+  catalog entries for `cos`/`power`. That reconstruction is the entire risk of opt 4
+  in miniature (§12 Q6). *Exit:* a yes/no on tractability in *days*, so the full
+  extension becomes schedulable-on-demand rather than a multi-week unknown — without
+  putting it on the duckdb-zarr critical path.
 - **M4 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
   vs. JAX, dialect canonicalization table, docs. **Plus (F6/F11/F12):** the
   expression-swell size/latency **benchmark** (§7.2), and the convention-pinning
@@ -919,6 +963,25 @@ Answers from Alex's review (2026-07-19), folded in:
    is no umbrella `ddx` crate — we don't need one. `ddx-core`, `ddx-datafusion`,
    `ddx-duckdb`, and `ddxdb` are all **free on crates.io**; `ddxdb` is **free on
    PyPI**; `ddx` is **free on the DuckDB community registry** (`INSTALL ddx`). (§10.)
+6. **C++ hybrid up front vs. `ddx('…')` first — keep `ddx('…')`, but transitional
+   (Fable follow-up, 2026-07-19).** The honest case for going C++ first is stronger
+   than earlier drafts credited: the bound path is *structurally* immune to the
+   F1/F2/F3/F5 silent-wrong class (§5.4 opt 4), not merely nicer UX. We still don't
+   flip, for three reasons: (a) the hard part of the C++ path (rebuilding a *bound*
+   derivative expression with correct `ColumnBinding` indices + catalog entries) is
+   orthogonal to what v1 must prove and version-coupled forever; (b) **DataFusion
+   Path B already buys the in-engine validation ~10× cheaper**; (c) `ddx('…')` is
+   additive — its only real risk is *social* (hardening into a contract), fixed by
+   branding it transitional, not by architecture. **What we changed instead:** brand
+   `ddx('…')` transitional (§5.4 opt 1, M3); pull the *risk* forward with the
+   M3-adjacent `BoundFunctionExpression` round-trip spike (§11), not the extension.
+   *Resolved sub-spike:* the tempting `SELECT * FROM query(ddx_rewrite('…'))`
+   collapse-to-a-scalar-function trick does **not** work — DuckDB's `query()` takes
+   a **literal string only** (and isn't SELECT-only) — so the table function's
+   bind-time-schema machinery (F7) is unavoidable.
+   *Tripwire:* if the F1/F2 syntactic guards prove messier than expected in M0, that
+   shifts the balance toward accelerating the C++ work (the bound path makes those
+   guards unnecessary) — decide then, not now.
 
 ---
 
@@ -1138,8 +1201,8 @@ the review was right on every count. Where each now lives:
 
 | # | Accepted change | Where |
 | --- | --- | --- |
-| F1 | Per-dialect identifier folding in `ColRef` (casefold unquoted, exact quoted) | §5.1, M0 |
-| F2 | Ambiguity guard made **symmetric** (mixed qualification either direction) | §5.5, §7.1, M0 |
+| F1 | Per-dialect identifier folding in `ColRef` (rule differs by dialect — DuckDB folds quoted too) | §5.1, M0 |
+| F2 | Ambiguity guard keyed on *uncertain* occurrences (a bare occurrence of the `wrt` base name) | §5.5, §7.1, M0 |
 | F3 | Projection-boundary (`stop_gradient`) contract + same-statement CTE-alias guard | §5.5, §7.1 |
 | F4 | Numeric-type policy moved into smart constructors (`CAST … AS DOUBLE`) | §5.1, M0 |
 | F5 | Byte-identical passthrough + splice-by-source-span; sqlparser-gatekeeper named | §5.1, §5.3, M0 |
@@ -1156,6 +1219,17 @@ documented as **best-effort** (fully detecting "identifier is a computed alias"
 across derived tables is subtle; the loud **contract** is the primary fix, the
 guard is the safety net), and F5's span-splicing carries a "confirm `Spanned`
 coverage for the pinned sqlparser in M0" caveat.
+
+**Second-pass corrections (2026-07-19, after a self-review of the fixes).** Three of
+the fixes above were themselves wrong on first cut and were corrected: **F2** — the
+"symmetric ≥2-qualifiers" guard over-fired and would have rejected
+`grad(a.x*b.x, a.x)`, the very form §7.1 recommends; retargeted to fire only on an
+*uncertain* (bare) occurrence of the `wrt` base name. **F1** — "exact-match quoted"
+is Postgres/DataFusion behavior; DuckDB folds *quoted* identifiers too, so the rule
+is now explicitly per-dialect. **F5** — the byte-identical guarantee needs a
+*parse-free* marker pre-gate (a marker-free query is never parsed), else it's
+vacuous exactly when sqlparser can't parse the statement. And the Fable follow-up on
+C++-vs-`ddx('…')` is folded in at §12 Q6 + §5.4 + M3.
 
 ---
 
