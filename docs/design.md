@@ -35,9 +35,15 @@ _status_: Design — iterating toward implementation.
 
 ## 1. Goal & thesis
 
-Build a **generic, portable component for XQL-style symbolic autograd** that can be
-installed into composable database systems (DataFusion, DuckDB, later Postgres),
-so a user can write calculus directly in SQL:
+**The goal is autograd for composable databases — culminating in training ML models in
+SQL.** We build it in two committed layers on one differentiation engine: (1) a
+**generic, portable component for XQL-style symbolic autograd** — scalar `grad` as
+columns, installable into DataFusion, DuckDB, later Postgres — and (2) **query-level
+reverse-mode AD** ("true AD", §7.3), where that scalar engine becomes the elementwise
+leaf and the system differentiates whole queries to emit backprop. Layer 1 is this
+doc's v1 (M0–M2); layer 2 is the headline, committed at **M3–M4** and de-risked by
+spikes ([`spikes/`](../spikes/README.md)). At the surface, a user writes calculus
+directly in SQL:
 
 ```sql
 SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
@@ -84,7 +90,7 @@ engine into a second IR scope (reverse-mode AD over queries)**, not by scaling s
   ML headline; the scalar engine below becomes its elementwise leaf, intact.
 
 So: don't downplay ML — *stage* it, and be precise that v1 is the primitive layer.
-M4's benchmark measures the scalar ceiling (swell vs. *N*) precisely so the v1/v2
+M6's benchmark measures the scalar ceiling (swell vs. *N*) precisely so the v1/v2
 line is drawn with data, not vibes.
 
 ### 1.1 Success criteria
@@ -465,7 +471,7 @@ the thesis (§3.1) would ship unproven. (It does **not** de-risk the DuckDB C++ 
 indices and catalog entries, is exactly what the DataFusion bridge *avoids* by
 leaning on DF's unparse/re-plan utilities; the two share only the shallow "walk
 plan, find marker, substitute" pattern. The honest DuckDB de-risker is the
-M3-adjacent spike, §11/§12 Q6.)
+M5-adjacent spike, §11/§12 Q6.)
 
 Implementation — the **bridge**, not a second rule engine. The rule walks the bound
 `LogicalPlan`, and for each `grad()` `ScalarFunction`:
@@ -551,11 +557,11 @@ options that remain:
      Pure Rust, community-installable, honors the `INSTALL ddx` vision. Cost: the
      `ddx('…')` wrapper instead of bare `grad()`. Re-entrancy is validated (R1b).
      **Three mechanics still to nail down (F7) — these are the actual substance of
-     M3, not details:**
+     M5, not details:**
      - **Bind-time schema (the hard part).** A DuckDB table function must declare
        its result columns at *bind* time, so `ddx('…')` must prepare/`DESCRIBE` the
        *rewritten* query on the inner connection during bind to learn its schema.
-       Feasible-looking but unspiked — named as an explicit M3 task.
+       Feasible-looking but unspiked — named as an explicit M5 task.
      - **Connection-scoped state is lost.** The inner `duckdb_connect` is a *new
        session*: the caller's **temp tables, session `SET`s, and prepared
        statements are invisible** inside `ddx('…')` (R1b covered only transaction
@@ -613,7 +619,7 @@ options that remain:
      the easy direction; **rebuilding a *bound* derivative expression on the way
      back — with correct `ColumnBinding` indices and catalog function entries for
      `cos`, `power`, … — is the gnarly part** (the 20% that is 80% of the work, and
-     DuckDB-version-coupled forever). Its miniature is exactly the M3-adjacent spike
+     DuckDB-version-coupled forever). Its miniature is exactly the M5-adjacent spike
      in §12 Q6. `autocxx` (auto-binding DuckDB's headers) is tempting but the headers
      are large/complex — prefer a narrow hand-written cxx bridge.
   5. **`CREATE MACRO`** — rejected: macros are fixed expansions and cannot perform
@@ -650,7 +656,7 @@ demand rather than a multi-week unknown.
 > session and transaction visibility. Recommendation: **`ddx('…')` for
 > self-contained queries; client-side Path A for stateful/transactional loops.**
 > (Engine-level re-entrancy/isolation is now established; a Rust-extension smoke
-> test remains as a confirmation task in M3.)
+> test remains as a confirmation task in M5.)
 >
 > Side finding: DuckDB types `0.0`-style literals as `DECIMAL`, so the rewrite
 > should emit `DOUBLE`-typed literals/casts (matching the prototype's `Float64`
@@ -837,7 +843,7 @@ engine-dependent). And `vjp` (F10) offers no reverse-mode amortization, so the t
 compound (G5): an N-parameter SGD step is N independent full derivations of the loss,
 per row, per iteration — which is precisely why ML abandoned symbolic diff for
 reverse-mode AD (Baydin et al., JMLR 2018). **v1 accepts this and positions around
-it** (low-N scientific calculus is the sweet spot, §1), but: (a) M4 benchmarks
+it** (low-N scientific calculus is the sweet spot, §1), but: (a) M6 benchmarks
 **swell vs. N** (not just vs. expression size) so the cliff is measured, not
 discovered, and so nothing is promised to duckdb-zarr users past where it holds; (b)
 the post-v1 remedy is a **let-binding pass** that factors shared subexpressions into
@@ -878,7 +884,7 @@ using only these rules and checked them against `jax.grad`: **max error ~1e-18
 
 - **`ddx-core` v1 is not superseded — it becomes the leaf.** The scalar `grad` is
   exactly the elementwise-primitive rule (`f′(X)`) in the table above. Everything
-  built in M0–M4 is the foundation of the AD system, not a throwaway.
+  built in M0–M2 is the foundation the AD system (M3–M4) stands on, not a throwaway.
 - **The right axis is IR *scope*, not "symbolic vs. tape."** JAX is also symbolic
   (it traces + rewrites a jaxpr); its architecture is *JVP rules for primitives +
   transpose rules for the linear ones*, with `vjp = transpose(linearize(f))`. Ours is
@@ -910,34 +916,32 @@ using only these rules and checked them against `jax.grad`: **max error ~1e-18
     engine**, not portable/standard SQL, and don't factor out a reusable scalar-AST
     symbolic differentiator. `ddx`'s contribution is the **engine-portable, SQL-surface,
     community-installable** form with `ddx-core` as the reusable elementwise leaf.
-  - *Key perf design decision:* their values are **chunked tensors** (a relation stores
-    sub-matrix *blocks*, not one scalar per cell), so the join kernel `⊗` is a real
-    **BLAS matmul on blocks**. That — not only sparsity — is the answer to the
-    "join-as-matmul vs. BLAS" ceiling below. `ddx`'s v2 should store chunked values.
+  - *Performance — logical purity, physical speed (design decision, not Tang et al.'s).*
+    Tang et al. get BLAS-class speed by making relation **values chunked tensors**
+    (blocks, not one scalar per cell). **`ddx` does not adopt that** — chunked values
+    would break the portable, one-value-per-coordinate long/tidy surface that the whole
+    project rests on (§1). Instead we keep the model **pure-logical** and push speed into
+    the **physical plan**: a fused-contraction operator (an "einsum"/aggregate-`HashJoin`
+    that computes `Σⱼ A·B` grouped, without materializing the full join, dispatching to
+    a matmul kernel on the dense path) as a DataFusion `ExecutionPlan`. Same BLAS payoff,
+    no data-model change — logical portability up top, engine-specific perf underneath.
 
-**Staging (roadmap, not a rewrite) — and Alex wants this pulled *earlier*, not
-parked in "future":**
-
-- **v1 — calculus as columns.** The scalar surface (`grad`/`jvp`) and §§5–11. This *is*
-  the primitive layer; nothing here is throwaway.
-- **v1.5 — relational-backprop reference (start in parallel with v1).** Clean up nn.py
-  into the canonical example + regression fixture (the spike shows the rules reproduce
-  it exactly); write the four transpose rules formally against Tang et al.'s formulation.
-- **v2 — `vjp` over queries: "differentiate queries, not expressions."**
-  `ddx.vjp(loss_query, wrt = weight_table)` emits the backward query program (the
-  `delta*`/`g*` relations), tape = materialized intermediates (chunked). This earns the
-  "ML in a database" headline. Per Alex's strong preference, v2 is a **committed track**,
-  not demand-driven "future" — the MLP + attention spikes have retired most of the risk;
-  the remaining items are engineering (chunked storage, the emitter, `MAX`/argmax
-  routing, LayerNorm) rather than open questions.
+**This is now a committed track with real milestones (§11), not a "someday."** The
+staging: **M0–M2** build the scalar core (the elementwise *leaf*); **M3** formalizes the
+four transpose rules + the relational-backprop reference; **M4** ships `ddx.vjp(query,
+wrt=table)` — the backward-query emitter — on DataFusion. The MLP + attention spikes have
+retired the generality risk; what remains is engineering (the emitter, `MAX`/argmax
+routing, LayerNorm, and the physical operator for speed), and `vjp` is reserved for
+exactly this (§12 Q7).
 
 **Honest limits to carry forward:** join-as-matmul has a ceiling vs. BLAS on *dense*
-scalar-per-cell data — countered two ways: **chunked tensor values** (BLAS on blocks,
-per Tang et al.) and native **sparsity** (the demo's `WHERE images <> 0` gave a measured
-~1.8× on Fashion-MNIST, free). And the demo's training loop is Python-orchestrated with
-`.cache()` as the tape — so "whole loop in one recursive CTE" does not survive real
-models; the doc stops leading with that claim (§7.1's recursive-CTE row is a *small*-loop
-demo, not the ML path). Full verification lives in [`spikes/`](../spikes/).
+scalar-per-cell data — countered by the **physical fused-contraction operator** above and
+by native **sparsity** (the demo's `WHERE images <> 0` gave a measured ~1.8× on
+Fashion-MNIST, free — a real "why AD in a database" argument). And the demo's training
+loop is Python-orchestrated with `.cache()` as the tape — so "whole loop in one recursive
+CTE" does not survive real models; the doc stops leading with that claim (§7.1's
+recursive-CTE row is a *small*-loop demo, not the ML path). Full verification lives in
+[`spikes/`](../spikes/README.md).
 
 ---
 
@@ -991,7 +995,7 @@ layered and reuses the prototype's:
   safe (reads, DML, no deadlock); it runs in its own transaction (can't see the
   caller's *uncommitted* state), so self-contained queries use `ddx('…')` and
   stateful loops use the client-side rewrite. Remaining: a Rust-extension smoke
-  test in M3.
+  test in M5.
 - **R2:** Confirm `datafusion-python` still can't inject an `AnalyzerRule` — this is
   what keeps xarray-sql on the SQL rewrite. (If a seam exists, it only *adds* a
   Path B option for xarray-sql; it does not change v1.)
@@ -1081,8 +1085,11 @@ Distribution:
 
 ## 11. Milestones
 
-With a lean core and one IR, the plan is short. `ddx-core` is the critical
-dependency; the integrations then go in parallel.
+The spine of the plan: build the scalar core (M0–M2), then **the true-AD track
+(M3–M4) is next — before broadening to more engines** — because ML in a database is
+the goal and it is now de-risked (§7.3). DuckDB and hardening follow (M5–M6).
+`ddx-core` is the critical dependency throughout; it is the scalar leaf the AD system
+is built on, not a throwaway.
 
 - **M0 — Extract the core.** Create the workspace; lift the prototype's
   `src/autograd.rs` into `ddx-core`, re-pointing the rules from DataFusion `Expr`
@@ -1106,12 +1113,32 @@ dependency; the integrations then go in parallel.
   `autograd.rs` in favor of `ddx-core`. (b) `ddx-datafusion`: marker UDFs + the
   `AnalyzerRule` bridge (unparse→`ddx-core`→reparse), plus the `ddx_sql` helper —
   mind the `TypeCoercion` ordering and `create_logical_expr` seam (G7). **Prereq
-  (G7): pull a *minimal* JAX-oracle numeric-agreement harness forward from M4** —
+  (G7): pull a *minimal* JAX-oracle numeric-agreement harness forward from M6** —
   M2's "green vs JAX" gate is unenforceable without it. *Exit:* xarray-sql green on
   `ddx-core` (vs JAX, no regressions) **and** bare `grad()` runs end-to-end through
   the `AnalyzerRule` in a native DataFusion test — the first proof of an in-engine
   rewrite.
-- **M3 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (read SQL
+  *— true AD is next (M3/M4), before broadening to more engines —*
+
+- **M3 — Relational reverse-mode AD, phase 1: the rules (true-AD foundation).**
+  Formalize the four transpose rules — contraction (`JOIN`+`GROUP BY SUM`),
+  elementwise (whose local derivative *is* `ddx-core`'s scalar `grad`), per-group
+  `SUM`, broadcast — plus `MAX`/argmax routing, against Tang et al.'s formulation.
+  Clean up xarray-sql#196 into the canonical relational-backprop example + regression
+  fixture. Build a rule-driven emitter and check it reproduces the MLP *and* attention
+  backward queries — the `spikes/` are the acceptance tests. *Exit:* the four rules,
+  written down and tested, reproduce `jax.grad` on the MLP and attention fixtures
+  (machine-exact, as the spikes already show by hand).
+- **M4 — `vjp` over queries, phase 2: the ML headline.** `ddx.vjp(loss_query,
+  wrt=table)` emits the backward query program (the `delta*`/`g*` relations); the tape
+  is materialized intermediate relations. Kept **pure-logical** — the long/tidy,
+  one-value-per-cell model is unchanged (**no** chunked-tensor values; §7.3). Runs
+  first on DataFusion, where M2 gave us the `AnalyzerRule` and full engine control.
+  Performance is a *separate, physical* concern (a fused-contraction "einsum" operator,
+  §7.3), not on the correctness critical path. *Exit:* train the xarray-sql#196 MLP
+  with gradients **emitted by `ddx.vjp`** (not hand-written), matching the hand-written
+  demo and JAX.
+- **M5 — DuckDB.** `ddx-duckdb` = the `ddx('<sql>')` table function (read SQL
   literal → `rewrite_sql` with `DuckDbDialect` → execute on inner connection →
   stream), plus the `ddxdb` client-side path for DuckDB-python. Integrate with
   duckdb-zarr; run the R1b Rust-extension smoke test. **Named tasks, not
@@ -1120,7 +1147,7 @@ dependency; the integrations then go in parallel.
   decision (SELECT-only by default). Also brand the extension **transitional** in
   its docs. *Exit:* `grad` works end-to-end via `SELECT * FROM ddx('…')` on a real
   duckdb-zarr dataset, with the schema/DML behavior documented.
-- **M3-adjacent spike (de-risks §5.4 opt 4; schedule with M3, not after).** The
+- **M5-adjacent spike (de-risks §5.4 opt 4; schedule with M5, not after).** The
   miniature of the whole C++ hybrid: from an `OptimizerExtension`, serialize **one**
   `grad` `BoundFunctionExpression` out to `ddx-core`, differentiate, and **rebuild
   one bound derivative expression back in** — correct `ColumnBinding` indices,
@@ -1128,20 +1155,13 @@ dependency; the integrations then go in parallel.
   in miniature (§12 Q6). *Exit:* a yes/no on tractability in *days*, so the full
   extension becomes schedulable-on-demand rather than a multi-week unknown — without
   putting it on the duckdb-zarr critical path.
-- **M4 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
+- **M6 — Math roadmap & hardening.** Extend rules (§7), cross-engine equivalence
   vs. JAX, dialect canonicalization table, docs. **Plus (F6/F11/F12):** the
   expression-swell size/latency **benchmark** (§7.2), and the convention-pinning
   tests for NULL-folding, kinks, and domain edges (§8).
-- **v1.5 — relational-backprop reference (parallel with v1).** Clean up the
-  xarray-sql#196 MLP into the canonical example / regression fixture (the v2 emitter's
-  compilation target, §7.3); formalize the four transpose rules against Tang et al.
-- **v2 — query-level reverse-mode AD (the ML headline) — committed track, not "future."**
-  `ddx.vjp(query, wrt=table)` emitting a backward query program over chunked-tensor
-  relations (§7.3). The generality de-risk is **done**: MLP *and* attention (incl.
-  causal mask) reproduce `jax.grad` machine-exact from the four rules ([`spikes/`](../spikes/),
-  §13.6). Remaining is engineering — chunked storage (BLAS on blocks), the emitter,
-  `MAX`/argmax routing, LayerNorm — not open research.
-- **Future (post-v1, demand-driven):** the C++/cxx.rs hybrid for bare `grad()` in
+- **Future (post-M6, demand-driven):** a physical fused-contraction operator to make
+  M4's emitted backprop fast on dense data (§7.3); more architectures (LayerNorm,
+  conv); the C++/cxx.rs hybrid for bare `grad()` in
   DuckDB (§5.4 opt 4) and `ddx-pg` (Postgres).
 
 ---
@@ -1181,8 +1201,8 @@ Answers from Alex's review (2026-07-19), folded in:
    Path B already buys the in-engine validation ~10× cheaper**; (c) `ddx('…')` is
    additive — its only real risk is *social* (hardening into a contract), fixed by
    branding it transitional, not by architecture. **What we changed instead:** brand
-   `ddx('…')` transitional (§5.4 opt 1, M3); pull the *risk* forward with the
-   M3-adjacent `BoundFunctionExpression` round-trip spike (§11), not the extension.
+   `ddx('…')` transitional (§5.4 opt 1, M5); pull the *risk* forward with the
+   M5-adjacent `BoundFunctionExpression` round-trip spike (§11), not the extension.
    *Resolved sub-spike:* the tempting `SELECT * FROM query(ddx_rewrite('…'))`
    collapse-to-a-scalar-function trick does **not** work — DuckDB's `query()` takes
    a **literal string only** (and isn't SELECT-only) — so the table function's
@@ -1205,6 +1225,11 @@ Answers from Alex's review (2026-07-19), folded in:
 ---
 
 ## 13. Adversarial review (2026-07-19, Fable 5)
+
+> **Milestone-numbering note.** This section uses the milestone numbers as they stood
+> at review time. The plan was later reprioritized (§11) to put the true-AD track at
+> **M3–M4**, shifting **DuckDB M3 → M5** and **hardening M4 → M6**. Read the M-numbers
+> below accordingly; §11 is authoritative.
 
 _Reviewed: this doc (v0.2) plus the prototype it is grounded in —
 [xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192), all 13
@@ -1465,7 +1490,7 @@ are characters). **Accepted 8 of 9; partial on G8.**
 | G3 | Spans are line/column *characters*, not byte ranges (**confirmed**) | Span→byte conversion subsystem; multibyte/multi/nested-marker M0 task | §5.1, M0 |
 | G4 | F3 CTE-alias guard forbade the doc's own `grad(s*s, s)` | Carve-out: fire only when a computed alias is a *non-`wrt`* term | §5.5, §7.1 |
 | G5 | Pitch: headline (training loops) is where limits bite hardest | **Stage, don't retreat** — v1 = calculus-as-columns (primitive layer); v2 = query-level reverse-mode AD (§7.3), de-risked by a verified spike; ML is the destination | §1, §2, §7.3, M4 |
-| G6 | Contradiction: DF Path B "de-risks" DuckDB C++ (it doesn't) | Deleted the de-risk clause; the M3-adjacent spike is the honest de-risker | §5.3, §5.4 |
+| G6 | Contradiction: DF Path B "de-risks" DuckDB C++ (it doesn't) | Deleted the de-risk clause; the M5-adjacent spike is the honest de-risker | §5.3, §5.4 |
 | G7 | Pre-gate/marker case+whitespace; `TypeCoercion` order; oracle-in-M2 | Case-fold gate+marker; named the `create_logical_expr` seam; pulled oracle to M2 | §5.1, §5.3, M2 |
 | G8 | Cut `vjp`? (it's a 2-token macro in v1) | **Resolved by the §7.3 spike — CUT.** Reserve `vjp` for query-level reverse mode; v1 ships `grad` + `jvp` | §5.1, §7, §7.1, §12 Q7 |
 | G9 | `sqlparser`-gap examples stale (3 of 4 actually parse) | Refreshed to `PIVOT`/`#1`; version-pinned the coverage claim | §5.3 |
@@ -1494,10 +1519,12 @@ causal mask) from the same four rules, machine-exact — retiring "does it gener
 the MLP?" (2) Tang et al. (ICML 2023) reviewed: same method (per-operator
 relation-Jacobian products over a functional RA), peer-reviewed and shown
 performance-competitive at billion-scale. So the direction is validated; `ddx`'s
-differentiator is the portable / SQL-surface / installable form + reusable scalar leaf,
-and the perf answer to "join vs. BLAS" is **chunked-tensor values** (blocks, not
-scalar-per-cell). Per Alex's preference, v2 (true AD) is now a **committed track**
-(§7.3, §11), not demand-driven future.
+differentiator is the portable / SQL-surface / installable form + reusable scalar leaf.
+On perf, `ddx` diverges from Tang et al. deliberately (Alex's call): **keep the
+pure-logical long/tidy model** (no chunked-tensor values, which would break the portable
+surface) and push BLAS-class speed into a **physical fused-contraction operator** (§7.3).
+Per Alex's preference, true AD is now a **committed track at M3–M4** (§7.3, §11), before
+DuckDB — not demand-driven future.
 
 _Next step:_ Alex to review; then iterate this doc (with agents) before we start
 M0. The prototype's `autograd.rs` and its Python test suite are the concrete
