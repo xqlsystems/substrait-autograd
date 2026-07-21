@@ -253,7 +253,7 @@ first draft, verified against `nn.py:325-333`.
 `nn.py`'s actual pattern (`nn.py:308,318,339,348`) and keeping every transpose rule
 independent of a global `N`.
 
-### 3.4 Route (argmax/argmin) — still the fifth rule, now with a second open risk
+### 3.4 Route (argmax/argmin) — both open risks now resolved by spike
 
 **Forward, as `nn.py` already writes it** (`nn.py:437-445`, not yet wrapped in a
 marker — this is the concrete migration needed to bring it under v2):
@@ -266,29 +266,54 @@ WITH ranked AS (
 SELECT {group_dims}, {route_dim}, val FROM ranked WHERE rk = 1
 ```
 **Transpose:** scatter — cotangent flows only to the winning row, zero elsewhere —
-unchanged from the first draft (§3.4 there), still the standard max-pool/hard-routing
-subgradient convention.
+the standard max-pool/hard-routing subgradient convention.
 
-**Two open risks now, not one.** The first draft flagged this rule as
-**mathematically unverified** (no spike checks it against `jax.grad`, unlike the
-other four). This revision adds a **second, more basic risk specific to choosing
-Substrait**: it is not confirmed that Substrait's window-function support
-(`ConsistentPartitionWindowRel` in the spec) is actually implemented by both
-DataFusion's and DuckDB's Substrait producer/consumer — a DataFusion project search
-turned up an explicit, current statement that "Substrait does not (yet) support the
-full range of plans and expressions that DataFusion offers." This is exactly the
-same *class* of risk `design.md` already names for sqlparser's `DuckDbDialect`
-coverage (F5/G9) — a version-treadmill / coverage-gatekeeper pattern — just
-recurring one layer up, on Substrait's own relation vocabulary instead of a SQL
-dialect. **Recommend, as a named M3 task:** before trusting `Route`, spike whether
-`ROW_NUMBER() OVER (PARTITION BY … ORDER BY …)` — the exact idiom `nn.py` already
-uses — actually round-trips through both engines' Substrait producers/consumers at
-all, *before* separately checking its gradient math. If window-relation support is
-missing or partial, `Route` may need to stay a v1-style **text-splice escape
-hatch** (bypass the plan-IR path entirely for this one rule, execute it as raw SQL
-the way Path A already does) rather than a plan-level rule — a real, and now
-concretely named, fallback design worth deciding on purpose rather than
-discovering under deadline.
+**Risk 1 (math) — RESOLVED, `spikes/route_ad_spike.py`.** A max-pool-style layer's
+gradient, computed by this rule (scatter the cotangent to the per-group argmax row,
+zero elsewhere), matches `jax.grad` **machine-exact (0.00e+00)** away from ties.
+**At an exact tie, the conventions genuinely differ** — our rule's deterministic
+first-index tiebreak (matching SQL's own `ROW_NUMBER()` ordering) routes the whole
+cotangent to the first winner; `jax.grad(jnp.max)` *splits* it evenly across every
+tied-for-max entry. Both are defensible, standard conventions (JAX's own docs don't
+treat one as more "correct"), but they are **not the same one**, and the rule must
+**pin its own explicitly** — the same treatment `design.md` §8/F12 already gives
+the `abs`-at-0 kink. Do not claim, or test for, agreement with `jax.grad` at ties;
+test for agreement with the *stated* convention instead.
+
+**Risk 2 (Substrait window-relation coverage) — RESOLVED, more precisely than
+feared, `spikes/duckdb_substrait_window_bug.py`.** The concern in the first
+revision of this document was that Substrait's window-relation support
+(`ConsistentPartitionWindowRel`) might not be implemented well enough by both
+engines. The real finding is narrower and more actionable:
+- A **plain window function as an output column** (no filter) round-trips
+  correctly through DuckDB's `get_substrait`/`from_substrait` — so
+  `ConsistentPartitionWindowRel` itself is fine.
+- The **full top-1-per-group idiom** (`QUALIFY`/`WHERE rk = 1` filtering a
+  `ROW_NUMBER()` window) round-trips through DuckDB **silently wrong** — no
+  exception, but `from_substrait` returns *every* row instead of the filtered
+  top-1 rows. Root cause, confirmed via `get_substrait_json`: DuckDB's own query
+  optimizer rewrites this idiom into a self-join against an `arg_max` extension
+  aggregate **before** Substrait export, and that rewritten form does not survive
+  the round-trip faithfully. This reproduces with **no ddx marker involved at
+  all** — a pre-existing DuckDB bug, not a marker-interaction artifact.
+- The **identical full idiom round-trips correctly through DataFusion** — which
+  isolates this as a DuckDB-specific implementation bug, not a general gap in
+  Substrait's window-relation vocabulary or in engines' support for it broadly.
+- A **two-step workaround is verified to produce the correct result**: run the
+  Substrait round-trip on *only* the window-column computation (confirmed
+  working above), materialize it, then apply the `rk = 1` filter as a second,
+  plain, ddx-authored SQL statement executed directly by the engine — not
+  through Substrait. Since ddx already authors and controls this filter step's
+  text (§4.3's backward steps are unmarked, engine-native SQL for the same
+  reason), this costs nothing architecturally beyond splitting one query into
+  two.
+
+**Consequence:** `Route` does **not** need to be gated on an upstream DuckDB fix,
+and does not need the text-splice fallback the first revision considered. It ships
+on both engines in M3, using the two-step form on DuckDB. Filing the underlying bug
+against `github.com/substrait-io/duckdb-substrait-extension` is still worth doing
+— per the stated preference to fix real bugs upstream rather than route around them
+indefinitely — but it is not on ddx's critical path.
 
 ### 3.5 `StopGradient`
 
@@ -429,12 +454,21 @@ drop-in replacement for the hand-written demo.
   downplayed:** ddx v2 is now bounded by whatever relation/expression vocabulary
   Substrait itself, and each engine's producer/consumer, actually implement — the
   same "coverage gatekeeper" pattern `design.md` already lives with for
-  `sqlparser`'s `DuckDbDialect` (F5/G9), recurring one layer up. §3.4 already found
-  one concrete instance (window-function support, unverified). This is a real cost
+  `sqlparser`'s `DuckDbDialect` (F5/G9), recurring one layer up. §3.4 found and
+  resolved a concrete instance of exactly this pattern: DuckDB's Substrait
+  round-trip silently drops the semantics of a top-1-per-group window-filter
+  idiom (a real, reproducible bug, independent of ddx), while DataFusion's does
+  not. The resolution — a verified two-step workaround, not a wait for an
+  upstream fix — is the template for how this class of risk gets handled going
+  forward: **spike each rule's forward idiom against both engines' actual
+  Substrait implementations before trusting it**, the same discipline `design.md`
+  already applies to `sqlparser` dialect coverage. This is a real, recurring cost
   of reuse versus building a bespoke IR (which would never refuse *because of a
-  format's coverage gap* — only because a rule wasn't implemented yet) — worth the
-  trade, given the portability payoff §1.4's spike demonstrates, but worth stating
-  in `design.md` rather than treated as free.
+  format's coverage gap* — only because a rule wasn't implemented yet), and it
+  will very likely recur for rules not yet built (LayerNorm, conv) — worth the
+  trade, given the portability payoff §1.4 and §3.4 both now demonstrate with
+  evidence, but budget the per-rule spike as a standing tax, not a one-time cost
+  already paid.
 
 ---
 
@@ -444,4 +478,4 @@ drop-in replacement for the hand-written demo.
 2. **How does a user express a loss query?** The plan's terminal (no-further-consumer) relation, ordinarily a `ddx_reduce_mark`-tagged `SUM`, seeded with cotangent `1.0`. §5.
 3. **How does the emitter recognize primitives?** By locating ddx's own registered Substrait extension-function anchors (`ddx_contract_mark`, `ddx_reduce_mark`, `ddx_route_mark`, `ddx_stop_gradient`) — explicit tags surviving from user-written SQL through the engine's own SQL→Substrait planning, never inferred from plan shape. Verified end-to-end, including cross-engine, by `spikes/substrait_ad_marker_spike.py`. §1.4, §2.
 4. **How is the tape named/materialized?** `__ddx_fwd_{node_id}`/`__ddx_bwd_{node_id}`, each a plain (unmarked) Substrait `Plan` executed and stored via the *engine's own* Substrait consumer (`from_substrait`, `datafusion-substrait`) — ddx-core builds plans, not SQL text, for this layer. §4.3.
-5. **What was missing from the four-rule table, and what's newly at risk from the pivot?** `Route` (§3.4) remains the one rule unverified against `jax.grad`, and now carries a **second**, more basic open question — whether Substrait's window-relation support is even implemented well enough by both target engines to carry it — named as a dedicated M3 spike, with an explicit fallback (keep `Route` on a v1-style text-splice path) if it isn't.
+5. **What was missing from the four-rule table, and is it resolved?** `Route` (§3.4) — both open questions are now closed by spike. Math: machine-exact vs. `jax.grad` away from ties; at an exact tie the two conventions genuinely differ and `Route` must pin its own (first-index tiebreak) rather than claim JAX agreement. Substrait feasibility: DuckDB's round-trip of the full top-1-per-group idiom is silently wrong (a real, narrow, reproducible bug, isolated from DataFusion's correct round-trip of the same idiom), but a verified two-step workaround ships `Route` on both engines in M3 without waiting on an upstream fix — worth filing upstream anyway, just not blocking.
