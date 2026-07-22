@@ -415,7 +415,10 @@ fn walk_set_expr(body: &SetExpr, out: &mut HashSet<String>) {
 fn walk_select(select: &Select, out: &mut HashSet<String>) {
     for item in &select.projection {
         if let SelectItem::ExprWithAlias { expr, alias } = item {
-            if !is_bare_column(expr) {
+            // A *computed* alias is one whose projected expression is not a
+            // plain column reference. `ColRef::from_expr` is the single place
+            // that recognizes a column reference (seeing through `Nested`).
+            if ColRef::from_expr(expr).is_none() {
                 out.insert(alias.value.to_ascii_lowercase());
             }
         }
@@ -436,10 +439,6 @@ fn walk_table_factor(tf: &TableFactor, out: &mut HashSet<String>) {
     }
 }
 
-fn is_bare_column(e: &Expr) -> bool {
-    matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-        || matches!(e, Expr::Nested(inner) if is_bare_column(inner))
-}
 
 // ---------------------------------------------------------------------------
 // Span (1-based character line/column) → byte offset conversion (G3)

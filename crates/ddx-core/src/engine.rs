@@ -15,7 +15,7 @@ use std::f64::consts::{LN_10, LN_2};
 use std::sync::Arc;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     ObjectNamePart, UnaryOperator,
 };
 
@@ -193,9 +193,11 @@ fn linearize(expr: &Expr, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
         // constructors re-introduce any precedence parentheses the result needs.
         Expr::Nested(inner) => linearize(inner, leaf, reg),
 
-        // A cast is locally linear: tangent of cast(u) = cast(du) to the same
-        // type (matches the prototype; non-numeric casts are unusual as a
-        // differentiation target).
+        // A cast to a numeric type is locally linear: tangent of cast(u) =
+        // cast(du) to the same type. A cast to a non-numeric type (VARCHAR,
+        // DATE, BOOLEAN, …) is not differentiable — differentiating through it
+        // would emit a nonsensical `CAST(1.0 AS VARCHAR)`, so it is a typed
+        // error rather than a silently-wrong derivative (principle 5).
         Expr::Cast {
             kind,
             expr: inner,
@@ -203,6 +205,12 @@ fn linearize(expr: &Expr, leaf: &Leaf, reg: &RuleRegistry) -> Result<Expr> {
             array,
             format,
         } => {
+            if !is_numeric_type(data_type) {
+                return Err(DiffError::NotImplemented(format!(
+                    "differentiation through a cast to non-numeric type `{data_type}` \
+                     is not supported"
+                )));
+            }
             let du = linearize(inner, leaf, reg)?;
             Ok(Expr::Cast {
                 kind: kind.clone(),
@@ -365,4 +373,71 @@ pub(crate) fn positional_args(f: &Function) -> Option<Vec<&Expr>> {
         }
         _ => None,
     }
+}
+
+/// True if `dt` is a numeric type — the only kind of cast that is locally
+/// linear (and so differentiable). The list is exhaustive for the pinned
+/// `sqlparser` version; a `sqlparser` bump is already a breaking release of
+/// `ddx-core` (design.md §6, G2), at which point this is re-checked.
+fn is_numeric_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        // Floating-point / fixed-point.
+        DataType::Numeric(_)
+            | DataType::Decimal(_)
+            | DataType::BigNumeric(_)
+            | DataType::BigDecimal(_)
+            | DataType::Dec(_)
+            | DataType::Float(_)
+            | DataType::FloatUnsigned(_)
+            | DataType::Float4
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Real
+            | DataType::RealUnsigned
+            | DataType::Float8
+            | DataType::Double(_)
+            | DataType::DoubleUnsigned(_)
+            | DataType::DoublePrecision
+            | DataType::DoublePrecisionUnsigned
+            // Integers (signed / unsigned / width-tagged aliases).
+            | DataType::TinyInt(_)
+            | DataType::TinyIntUnsigned(_)
+            | DataType::UTinyInt
+            | DataType::Int2(_)
+            | DataType::Int2Unsigned(_)
+            | DataType::SmallInt(_)
+            | DataType::SmallIntUnsigned(_)
+            | DataType::USmallInt
+            | DataType::MediumInt(_)
+            | DataType::MediumIntUnsigned(_)
+            | DataType::Int(_)
+            | DataType::Int4(_)
+            | DataType::Int8(_)
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Int128
+            | DataType::Int256
+            | DataType::Integer(_)
+            | DataType::IntUnsigned(_)
+            | DataType::Int4Unsigned(_)
+            | DataType::IntegerUnsigned(_)
+            | DataType::HugeInt
+            | DataType::UHugeInt
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::UInt128
+            | DataType::UInt256
+            | DataType::BigInt(_)
+            | DataType::BigIntUnsigned(_)
+            | DataType::UBigInt
+            | DataType::Int8Unsigned(_)
+            | DataType::Signed
+            | DataType::SignedInteger
+            | DataType::Unsigned
+            | DataType::UnsignedInteger
+    )
 }

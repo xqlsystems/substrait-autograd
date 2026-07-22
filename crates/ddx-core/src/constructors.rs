@@ -200,16 +200,25 @@ pub fn div(a: Expr, b: Expr) -> Expr {
     }
 }
 
-/// `-a`, folding `-0 = 0` and parenthesizing a binary operand
+/// `-a`, folding `-0 = 0` and `-(-e) = e`, and parenthesizing a binary operand
 /// (`-(a + b)`, `-(a / b)`), since unary minus binds tighter than either.
 pub fn neg(a: Expr) -> Expr {
     if is_zero(&a) {
-        zero()
-    } else {
+        return zero();
+    }
+    match a {
+        // Double negation cancels. This is not just simplification: without it,
+        // `neg(neg(e))` renders as two adjacent minus tokens `--e`, which SQL
+        // parses as a line comment — a silently-wrong result in valid-looking
+        // SQL (e.g. d/dx(-cos(x)) = sin(x) would emit `--sin(x)`).
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
-            expr: Box::new(wrap(a, 30, true)),
-        }
+            expr,
+        } => *expr,
+        other => Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(wrap(other, 30, true)),
+        },
     }
 }
 

@@ -97,6 +97,35 @@ fn general_power_uv_errors() {
 }
 
 #[test]
+fn double_negation_does_not_render_a_comment() {
+    // d/dx(-cos(x)) = sin(x). The intermediate is neg(neg(sin(x))); without
+    // folding it renders as `--sin(x)`, a SQL line comment (a silently-wrong
+    // result). It must fold to `sin(x)`.
+    let out = d("-cos(x)", "x");
+    assert!(!out.contains("--"), "rendered a `--` comment: {out}");
+    assert_eq!(out, "sin(x)");
+    // And nested inside a larger expression, still no stray `--`.
+    let nested = d("sin(-cos(x))", "x");
+    assert!(!nested.contains("--"), "rendered a `--` comment: {nested}");
+    assert_eq!(nested, "cos(-cos(x)) * sin(x)");
+}
+
+#[test]
+fn cast_to_numeric_type_is_differentiable() {
+    // A numeric cast is locally linear: d/dx CAST(x*x AS DOUBLE) = CAST(x+x AS DOUBLE).
+    assert_eq!(d("CAST(x * x AS DOUBLE)", "x"), "CAST(x + x AS DOUBLE)");
+}
+
+#[test]
+fn cast_to_non_numeric_type_errors() {
+    // Differentiating through CAST(... AS VARCHAR) would emit a nonsensical
+    // CAST(1.0 AS VARCHAR); it must be a typed error instead.
+    assert!(Ddx::new()
+        .differentiate_sql("CAST(x AS VARCHAR)", "x", &GenericDialect {})
+        .is_err());
+}
+
+#[test]
 fn jvp_seeds_a_tangent_on_one_input() {
     // jvp(x*y, x, dx) = product rule with tangent(x)=dx, tangent(y)=0 = dx*y
     let out = Ddx::new()
