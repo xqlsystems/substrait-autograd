@@ -21,7 +21,8 @@ use sqlparser::ast::{
 
 use crate::colref::{ColRef, IdentCasing, Match};
 use crate::constructors::{
-    add, as_const, div, func, func1, is_zero, mul, neg, num, one, sign, square, sub, zero,
+    add, as_const, div, finite_num, func, func1, is_zero, mul, neg, num, one, sign, square, sub,
+    zero,
 };
 use crate::error::{DiffError, Result};
 
@@ -323,19 +324,18 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
     match (as_const(base), as_const(exponent)) {
         // Constant exponent (covers x^2, x^0.5, x^-2, ...).
         (_, Some(c)) => {
-            // A non-finite constant (e.g. an out-of-range literal `1e400`) would
-            // otherwise be emitted as an `inf`/`NaN` token — invalid SQL. Fail
-            // loud instead (#33).
-            if !c.is_finite() {
-                return Err(DiffError::NotImplemented(format!(
-                    "power(base, {c}): a non-finite constant exponent is not differentiable"
-                )));
-            }
             let dbase = linearize(base, leaf, reg)?;
             if is_zero(&dbase) {
                 return Ok(zero());
             }
-            let outer = mul(num(c), func("power", vec![base.clone(), num(c - 1.0)]));
+            // `finite_num` fails loud on a non-finite constant (e.g. an
+            // out-of-range literal `1e400` → inf), but *only here at emission* —
+            // after the zero short-circuit above — so a wrt-independent base
+            // still differentiates to `0` rather than erroring (#49/F1, #33).
+            let outer = mul(
+                finite_num(c)?,
+                func("power", vec![base.clone(), finite_num(c - 1.0)?]),
+            );
             Ok(mul(outer, dbase))
         }
         // Constant base, variable exponent.
@@ -345,18 +345,11 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
                 return Ok(zero());
             }
             // The derivative is `a^u · ln(a) · du`; `ln(a)` is non-finite for a
-            // non-positive (or infinite) base, which would emit an `inf`/`NaN`
-            // token. Fail loud rather than emit invalid SQL (#33).
-            let ln_a = a.ln();
-            if !ln_a.is_finite() {
-                return Err(DiffError::NotImplemented(format!(
-                    "power({a}, exponent): the derivative needs ln(base), but ln({a}) is \
-                     not finite — the constant base must be positive"
-                )));
-            }
+            // non-positive (or infinite) base — `finite_num` fails loud there
+            // rather than emit an `inf`/`NaN` token (#33).
             let outer = mul(
                 func("power", vec![base.clone(), exponent.clone()]),
-                num(ln_a),
+                finite_num(a.ln())?,
             );
             Ok(mul(outer, dexp))
         }

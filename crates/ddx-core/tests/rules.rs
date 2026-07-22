@@ -138,6 +138,16 @@ fn power_non_finite_constant_exponent_errors() {
 }
 
 #[test]
+fn non_finite_exponent_still_differentiates_to_zero_when_base_is_constant_in_wrt() {
+    // The non-finite constant only blocks emission *when actually emitted*. If
+    // the base doesn't depend on the differentiation variable, the derivative is
+    // 0 and no non-finite literal is ever built — so this must return 0, not
+    // error (review #49/F1: the finiteness check must follow the zero
+    // short-circuit, matching the constant-base branch).
+    assert_eq!(d("power(x, 1e400)", "y"), "0.0");
+}
+
+#[test]
 fn schema_qualified_call_does_not_match_builtin_rule() {
     // myschema.sin(x) may be an unrelated user function; it must NOT silently
     // differentiate via the built-in sin rule (review #47).

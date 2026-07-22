@@ -24,6 +24,8 @@ use sqlparser::ast::{
     UnaryOperator, Value,
 };
 
+use crate::error::{DiffError, Result};
+
 // ---------------------------------------------------------------------------
 // Literals and constant inspection
 // ---------------------------------------------------------------------------
@@ -60,10 +62,14 @@ fn raw_num(v: f64) -> Expr {
 /// emitting a `Value("-1.0")` would reparse to a `UnaryOp` and break it
 /// (round-3 review #46).
 ///
-/// `v` must be finite: the only user-derived numbers that reach `num` come
-/// through the `power` rule, which guards `ln(base)`/overflow before calling
-/// (so a non-finite value here is a caller bug, not user input — #33).
-pub fn num(v: f64) -> Expr {
+/// `v` must be finite. For a *compile-time-known* finite constant (`0`, `1`,
+/// `2`, `ln 2`, …) call `num` directly. For any value *computed from user input*
+/// — which can overflow to `inf` or produce `NaN` — call [`finite_num`] instead,
+/// which fails loud rather than emit an invalid `inf`/`NaN` literal (#33). This
+/// is why `num` is not part of the public `build` surface: external callers get
+/// the checked [`finite_num`], so a non-finite value can never silently become
+/// `inf.0` in a release build.
+pub(crate) fn num(v: f64) -> Expr {
     debug_assert!(v.is_finite(), "num expects a finite value (got {v})");
     if v < 0.0 {
         Expr::UnaryOp {
@@ -74,6 +80,25 @@ pub fn num(v: f64) -> Expr {
         // `+0.0` and `-0.0` both land here (`-0.0 < 0.0` is false); normalize so
         // `-0.0` never renders as the literal `-0.0`.
         raw_num(if v == 0.0 { 0.0 } else { v })
+    }
+}
+
+/// A numeric literal for a value that *might not be finite* — the checked
+/// counterpart of [`num`]. Emits the literal if `v` is finite, else a typed
+/// [`DiffError::NotImplemented`]: a non-finite value has no valid SQL literal
+/// (`inf`/`NaN` are not numbers), so a derivative that would carry one must fail
+/// loud, never emit invalid SQL (#33). Use this for every value derived from
+/// user input or an arithmetic that can overflow (e.g. `ln(base)`, an
+/// out-of-range exponent). This is the single seam through which computed
+/// constants become literals.
+pub fn finite_num(v: f64) -> Result<Expr> {
+    if v.is_finite() {
+        Ok(num(v))
+    } else {
+        Err(DiffError::NotImplemented(format!(
+            "cannot emit a non-finite derivative constant ({v}); a non-finite \
+             value has no valid SQL literal"
+        )))
     }
 }
 
@@ -393,5 +418,28 @@ mod tests {
     fn div_by_one_folds_without_cast() {
         let x = Expr::Identifier(Ident::new("x"));
         assert_eq!(div(x, one()).to_string(), "x");
+    }
+
+    #[test]
+    fn num_emits_negatives_as_unary_minus() {
+        // A negative literal must match sqlparser's parse shape (UnaryOp{Minus,
+        // magnitude}) so derivatives round-trip; the rendered text is still
+        // `-2.0` / `-0.5`.
+        assert!(matches!(num(-2.0), Expr::UnaryOp { .. }));
+        assert_eq!(num(-2.0).to_string(), "-2.0");
+        assert_eq!(num(-0.5).to_string(), "-0.5");
+        assert_eq!(num(0.0).to_string(), "0.0"); // incl. -0.0 normalization
+        assert_eq!(num(-0.0).to_string(), "0.0");
+    }
+
+    #[test]
+    fn finite_num_rejects_non_finite_values() {
+        // The checked emission seam: finite values pass, inf/NaN fail loud
+        // (never a silent `inf.0`/`NaN.0` token). This is the public `build`
+        // surface, so external callers cannot emit invalid SQL in release.
+        assert_eq!(finite_num(2.0).unwrap().to_string(), "2.0");
+        assert!(finite_num(f64::INFINITY).is_err());
+        assert!(finite_num(f64::NEG_INFINITY).is_err());
+        assert!(finite_num(f64::NAN).is_err());
     }
 }

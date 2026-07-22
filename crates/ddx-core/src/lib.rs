@@ -56,7 +56,7 @@ mod rewrite;
 /// a custom [`Rule`], which returns `f'(u)` as an [`sqlparser::ast::Expr`].
 pub mod build {
     pub use crate::constructors::{
-        add, cast_double, div, func, func1, mul, neg, num, one, sign, square, sub, zero,
+        add, cast_double, div, finite_num, func, func1, mul, neg, one, sign, square, sub, zero,
     };
 }
 
