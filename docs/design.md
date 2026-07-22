@@ -849,10 +849,10 @@ ddx/                               (repo; crates published under the ddx-* names
 ├── crates/
 │   ├── ddx-core/                   # v1 engine — differentiate sqlparser::ast::Expr
 │   │                               #   + rewrite_sql; dep: sqlparser only
-│   ├── ddx-relad/                  # v2 engine — vjp_query over substrait::proto
+│   ├── ddx-ad/                      # v2 engine — vjp_query over substrait::proto
 │   │                               #   dep: substrait only
 │   ├── ddx-datafusion/             # markers + AnalyzerRule (Path B) + ddx_sql helper
-│   │                               #   deps: ddx-core, ddx-relad, datafusion
+│   │                               #   deps: ddx-core, ddx-ad, datafusion
 │   └── ddx-duckdb/                 # DuckDB community extension: `ddx('<sql>')` + v2 table fn
 ├── python/
 │   └── ddxdb/                      # PyO3/maturin wheel: rewrite_sql + Context.sql() shim
@@ -865,7 +865,7 @@ ddx/                               (repo; crates published under the ddx-* names
     └── ddx-pg/                     #   Postgres via pgrx (needs array/XQL support first)
 ```
 
-`ddx-core` and `ddx-relad` each publish independently, with a single
+`ddx-core` and `ddx-ad` each publish independently, with a single
 minimal dependency (`sqlparser`, `substrait`) and no engine crate, so either
 can be driven from a new engine without pulling in DataFusion or DuckDB. The
 heavy per-engine dependencies are quarantined in the adapter crates.
@@ -896,7 +896,7 @@ It fits the XQL family (`xql.systems`, `xarray-sql`, `duckdb-zarr`), and the
 thesis is in the name: "ML models as differentiable databases" → `d/dx` of a
 table. Practically: `autograd` is taken on PyPI; the bare `ddx` crate on
 crates.io is a dead project, so there's no umbrella crate (none needed);
-`ddx-core`, `ddx-relad`, `ddx-datafusion`, `ddx-duckdb`, and `ddxdb` are all
+`ddx-core`, `ddx-ad`, `ddx-datafusion`, `ddx-duckdb`, and `ddxdb` are all
 free on crates.io, `ddxdb` is free on PyPI, and `ddx` is free on the DuckDB
 community registry.
 
