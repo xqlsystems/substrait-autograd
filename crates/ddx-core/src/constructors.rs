@@ -1,0 +1,309 @@
+//! Smart constructors for building derivative `sqlparser::ast::Expr` trees.
+//!
+//! These own three correctness properties, not just algebraic tidiness
+//! (design.md §3.2):
+//!
+//! 1. **0/1-folding** — the JAX-`Zero`-tangent equivalent. Structurally-zero
+//!    terms are dropped and dead product branches short-circuit, keeping output
+//!    compact. This is a *stated* NULL-semantics convention (folding
+//!    `0 * (NULL-valued expr)` to `0`), documented and tested, not silent (F11).
+//! 2. **Numeric-type policy** — [`div`] forces floating-point division by
+//!    casting its numerator to `DOUBLE`, so `grad(x/y, y)` on integer columns
+//!    does not silently truncate (integer `/` differs across engines). Literals
+//!    are emitted with an explicit decimal point (F4).
+//! 3. **Precedence-safe construction** — composite operands are wrapped in
+//!    `Expr::Nested` exactly when the operator precedence requires it, because
+//!    `sqlparser`'s `Display` for a binary op emits no precedence parentheses.
+//!    Without this, a *constructed* `mul(add(a,b), c)` displays as `a + b * c`
+//!    and reparses as the wrong expression — a wrong number in valid SQL (G1).
+
+use sqlparser::ast::{
+    BinaryOperator, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    UnaryOperator, Value,
+};
+
+// ---------------------------------------------------------------------------
+// Literals and constant inspection
+// ---------------------------------------------------------------------------
+
+/// Format an `f64` as a SQL numeric literal that always carries a decimal point
+/// (or exponent), so it reads as floating-point rather than an integer literal.
+fn format_f64(v: f64) -> String {
+    let s = format!("{v}");
+    if s.contains(['.', 'e', 'E']) || s.contains("inf") || s.contains("NaN") {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// A numeric literal expression for `v` (e.g. `1.0`, `2.0`, `0.6931471805599453`).
+pub fn num(v: f64) -> Expr {
+    Expr::Value(Value::Number(format_f64(v), false).with_empty_span())
+}
+
+/// The constant `0.0` — the derivative of anything independent of `wrt`.
+pub fn zero() -> Expr {
+    num(0.0)
+}
+
+/// The constant `1.0` — the derivative of `wrt` itself.
+pub fn one() -> Expr {
+    num(1.0)
+}
+
+/// The `f64` value of a numeric literal expression, if it is one.
+///
+/// Sees through a single `Expr::Nested` wrapper so folding still recognizes a
+/// parenthesized literal.
+pub fn as_const(e: &Expr) -> Option<f64> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => s.parse::<f64>().ok(),
+            _ => None,
+        },
+        Expr::Nested(inner) => as_const(inner),
+        _ => None,
+    }
+}
+
+/// True if `e` is a numeric literal exactly equal to zero.
+pub fn is_zero(e: &Expr) -> bool {
+    matches!(as_const(e), Some(v) if v == 0.0)
+}
+
+/// True if `e` is a numeric literal exactly equal to one.
+pub fn is_one(e: &Expr) -> bool {
+    matches!(as_const(e), Some(v) if v == 1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Precedence-safe assembly (G1)
+// ---------------------------------------------------------------------------
+
+/// Binding-precedence of an expression's *top* operator, higher = binds tighter.
+/// Self-delimiting forms (literals, identifiers, function calls, `CAST`,
+/// already-`Nested`) are atoms and never need wrapping.
+fn precedence(e: &Expr) -> u8 {
+    match e {
+        Expr::BinaryOp { op, .. } => match op {
+            BinaryOperator::Plus | BinaryOperator::Minus => 10,
+            BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => 20,
+            _ => 20,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            ..
+        } => 30,
+        _ => 100,
+    }
+}
+
+/// Wrap `e` in `Expr::Nested` iff its precedence is below `threshold`
+/// (`strict`) or at-or-below it (`!strict`, for the right operand of a
+/// non-commutative operator, where equal precedence still needs parentheses:
+/// `a - (b - c)` ≠ `a - b - c`).
+fn wrap(e: Expr, threshold: u8, strict: bool) -> Expr {
+    let needs = if strict {
+        precedence(&e) < threshold
+    } else {
+        precedence(&e) <= threshold
+    };
+    if needs {
+        Expr::Nested(Box::new(e))
+    } else {
+        e
+    }
+}
+
+/// `left op right`, parenthesizing operands only where precedence demands it.
+fn binary(left: Expr, op: BinaryOperator, right: Expr) -> Expr {
+    let p = match op {
+        BinaryOperator::Plus | BinaryOperator::Minus => 10,
+        _ => 20,
+    };
+    let non_commutative = matches!(op, BinaryOperator::Minus | BinaryOperator::Divide);
+    Expr::BinaryOp {
+        left: Box::new(wrap(left, p, true)),
+        op,
+        right: Box::new(wrap(right, p, !non_commutative)),
+    }
+}
+
+/// Wrap `e` in a `CAST(... AS DOUBLE)`. Self-delimiting, so it never needs
+/// precedence parentheses as an operand.
+pub fn cast_double(e: Expr) -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(e),
+        data_type: DataType::Double(ExactNumberInfo::None),
+        array: false,
+        format: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The folding builders
+// ---------------------------------------------------------------------------
+
+/// `a + b`, dropping a structurally-zero operand.
+pub fn add(a: Expr, b: Expr) -> Expr {
+    if is_zero(&a) {
+        b
+    } else if is_zero(&b) {
+        a
+    } else {
+        binary(a, BinaryOperator::Plus, b)
+    }
+}
+
+/// `a - b`, dropping a zero right operand and turning `0 - b` into `-b`.
+pub fn sub(a: Expr, b: Expr) -> Expr {
+    if is_zero(&b) {
+        a
+    } else if is_zero(&a) {
+        neg(b)
+    } else {
+        binary(a, BinaryOperator::Minus, b)
+    }
+}
+
+/// `a * b`, folding `0 * _ = 0` and `1 * b = b` (and the mirror cases).
+pub fn mul(a: Expr, b: Expr) -> Expr {
+    if is_zero(&a) || is_zero(&b) {
+        zero()
+    } else if is_one(&a) {
+        b
+    } else if is_one(&b) {
+        a
+    } else {
+        binary(a, BinaryOperator::Multiply, b)
+    }
+}
+
+/// `a / b`, folding `0 / _ = 0` and `a / 1 = a`.
+///
+/// When a real division is emitted, the numerator is cast to `DOUBLE` so the
+/// division is floating-point on every engine — SQL integer division truncates
+/// on some and not others, which would make `grad(x/y, y)` on a `BIGINT`
+/// column silently wrong (F4). Casting one operand promotes the whole division;
+/// casting the *numerator* (not the result) is essential — `CAST(a/b AS DOUBLE)`
+/// would truncate before the cast.
+pub fn div(a: Expr, b: Expr) -> Expr {
+    if is_zero(&a) {
+        zero()
+    } else if is_one(&b) {
+        a
+    } else {
+        binary(cast_double(a), BinaryOperator::Divide, b)
+    }
+}
+
+/// `-a`, folding `-0 = 0` and parenthesizing a binary operand
+/// (`-(a + b)`, `-(a / b)`), since unary minus binds tighter than either.
+pub fn neg(a: Expr) -> Expr {
+    if is_zero(&a) {
+        zero()
+    } else {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(wrap(a, 30, true)),
+        }
+    }
+}
+
+/// `e * e`.
+pub fn square(e: Expr) -> Expr {
+    mul(e.clone(), e)
+}
+
+// ---------------------------------------------------------------------------
+// Function-call construction (for the outer factors of chain-rule terms)
+// ---------------------------------------------------------------------------
+
+/// Build an unqualified scalar function call `name(args...)`.
+pub fn func(name: &str, args: Vec<Expr>) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+/// `f(x)` — a unary call, the common case for chain-rule outer derivatives.
+pub fn func1(name: &str, x: Expr) -> Expr {
+    func(name, vec![x])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_additive_zero() {
+        assert_eq!(add(one(), zero()).to_string(), "1.0");
+        assert_eq!(add(zero(), one()).to_string(), "1.0");
+    }
+
+    #[test]
+    fn folds_multiplicative_identity_and_zero() {
+        assert_eq!(mul(one(), num(3.0)).to_string(), "3.0");
+        assert_eq!(mul(num(3.0), one()).to_string(), "3.0");
+        assert_eq!(mul(zero(), num(3.0)).to_string(), "0.0");
+    }
+
+    #[test]
+    fn sub_zero_left_is_negation() {
+        assert_eq!(
+            sub(zero(), Expr::Identifier(Ident::new("b"))).to_string(),
+            "-b"
+        );
+    }
+
+    #[test]
+    fn precedence_wrapping_is_semantic_not_cosmetic() {
+        // (a+b)*c must keep its parentheses under Display (G1). Without the
+        // Nested wrap this would render "a + b * c" and reparse wrongly.
+        let a = Expr::Identifier(Ident::new("a"));
+        let b = Expr::Identifier(Ident::new("b"));
+        let c = Expr::Identifier(Ident::new("c"));
+        let e = mul(add(a, b), c);
+        assert_eq!(e.to_string(), "(a + b) * c");
+    }
+
+    #[test]
+    fn non_commutative_right_operand_is_parenthesized() {
+        let a = Expr::Identifier(Ident::new("a"));
+        let b = Expr::Identifier(Ident::new("b"));
+        let c = Expr::Identifier(Ident::new("c"));
+        // a - (b + c) must keep parentheses; a - b + c would be wrong.
+        assert_eq!(sub(a, add(b, c)).to_string(), "a - (b + c)");
+    }
+
+    #[test]
+    fn div_casts_numerator_to_double() {
+        let x = Expr::Identifier(Ident::new("x"));
+        let y = Expr::Identifier(Ident::new("y"));
+        // Forces float division; integer x/y would otherwise truncate (F4).
+        assert_eq!(div(x, y).to_string(), "CAST(x AS DOUBLE) / y");
+    }
+
+    #[test]
+    fn div_by_one_folds_without_cast() {
+        let x = Expr::Identifier(Ident::new("x"));
+        assert_eq!(div(x, one()).to_string(), "x");
+    }
+}

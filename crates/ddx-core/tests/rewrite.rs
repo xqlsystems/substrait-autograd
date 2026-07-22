@@ -1,0 +1,238 @@
+//! End-to-end `rewrite_sql` tests: the marker path, span splicing, the guards,
+//! and identifier folding — the M0 deliverables of design.md §3.2 / §8.
+
+use ddx_core::sqlparser::dialect::{DuckDbDialect, GenericDialect};
+use ddx_core::{Ddx, DiffError};
+
+fn rw(sql: &str) -> String {
+    Ddx::new()
+        .rewrite_sql(sql, &GenericDialect {})
+        .unwrap_or_else(|e| panic!("rewrite_sql({sql}) failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// The basic marker path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replaces_a_grad_call_in_place() {
+    // grad(sin(x), x) -> (cos(x)); the surrounding SELECT is preserved.
+    assert_eq!(
+        rw("SELECT grad(sin(x), x) AS d FROM t"),
+        "SELECT (cos(x)) AS d FROM t"
+    );
+}
+
+#[test]
+fn full_gradient_as_tidy_columns() {
+    assert_eq!(
+        rw("SELECT grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g"),
+        "SELECT (y) AS dfdx, (x) AS dfdy FROM g"
+    );
+}
+
+#[test]
+fn marker_free_query_is_untouched() {
+    // Never parsed (parse-free pre-gate), returned byte-identical — even with
+    // formatting sqlparser would not reproduce.
+    let sql = "SELECT   a+b  AS  s   FROM t  -- comment";
+    assert_eq!(rw(sql), sql);
+}
+
+#[test]
+fn nested_higher_order_grad() {
+    // grad(grad(power(x,3), x), x) = d2/dx2 x^3 = 6x; inner differentiated first.
+    let out = rw("SELECT grad(grad(power(x, 3), x), x) AS d FROM t");
+    assert!(
+        !out.to_lowercase().contains("grad("),
+        "marker left behind: {out}"
+    );
+    // 3*power(x,2) -> d/dx -> 3 * (2 * power(x,1)) = 6*power(x,1)
+    assert!(out.contains("power(x, 1.0)"), "unexpected rewrite: {out}");
+}
+
+#[test]
+fn fires_inside_recursive_cte() {
+    // A whole Newton-step loop in one query: d/dx(x*x - 2) = x + x.
+    let out = rw("WITH RECURSIVE r AS (SELECT 1.0 AS x UNION ALL \
+         SELECT x - grad(x * x - 2, x) FROM r WHERE x < 10) SELECT x FROM r");
+    assert!(out.contains("(x + x)"), "unexpected rewrite: {out}");
+    assert!(
+        !out.to_lowercase().contains("grad("),
+        "marker left behind: {out}"
+    );
+}
+
+#[test]
+fn dml_update_rule_is_rewritten() {
+    let out = rw("INSERT INTO p SELECT theta - 0.1 * grad(x * theta, theta) FROM t");
+    assert!(
+        !out.to_lowercase().contains("grad("),
+        "marker left behind: {out}"
+    );
+    assert!(out.contains("(x)"), "unexpected rewrite: {out}");
+}
+
+// ---------------------------------------------------------------------------
+// Span splicing (G3 / F5): byte-identity outside the marker
+// ---------------------------------------------------------------------------
+
+#[test]
+fn splice_preserves_multibyte_prefix() {
+    // A multibyte character before the marker shifts its byte offset past its
+    // character column; naive column-as-byte splicing would corrupt this.
+    let out = rw("SELECT 'héllo', grad(sin(x), x) AS d FROM t");
+    assert_eq!(out, "SELECT 'héllo', (cos(x)) AS d FROM t");
+}
+
+#[test]
+fn splice_multiple_markers_on_one_line() {
+    // Two markers spliced independently, in reverse source order.
+    let out = rw("SELECT grad(sin(x), x), grad(cos(y), y) FROM t");
+    assert_eq!(out, "SELECT (cos(x)), (-sin(y)) FROM t");
+}
+
+#[test]
+fn splice_preserves_exact_surrounding_bytes() {
+    // Odd but valid spacing/casing around the marker is preserved verbatim.
+    let out = rw("SELECT    GRAD(x*x,x)  ,   y   FROM t");
+    assert_eq!(out, "SELECT    (x + x)  ,   y   FROM t");
+}
+
+// ---------------------------------------------------------------------------
+// Reserved names (F8) and the cut of scalar vjp (Q7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qualified_grad_is_left_alone() {
+    // Only unqualified grad/jvp are markers; myschema.grad(...) is a user fn.
+    let sql = "SELECT myschema.grad(x, x) AS d FROM t";
+    assert_eq!(rw(sql), sql);
+}
+
+#[test]
+fn scalar_vjp_is_not_a_marker() {
+    // vjp is reserved for query-level reverse-mode AD (Q7); as scalar SQL it is
+    // an ordinary (unknown) function, left untouched.
+    let sql = "SELECT vjp(sin(x), x, w) AS v FROM t";
+    assert_eq!(rw(sql), sql);
+}
+
+// ---------------------------------------------------------------------------
+// Identifier folding (F1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unquoted_identifiers_fold_case() {
+    // grad(Temp*Temp, temp) must match despite the case difference, and keep
+    // the original spelling in the output.
+    let out = Ddx::new()
+        .differentiate_sql("Temp * Temp", "temp", &GenericDialect {})
+        .unwrap();
+    assert_eq!(out, "Temp + Temp");
+}
+
+#[test]
+fn duckdb_folds_quoted_identifiers_too() {
+    // DuckDB is fully case-insensitive: "Temp" and temp are the same column.
+    let out = Ddx::for_duckdb()
+        .differentiate_sql(r#""Temp" * "Temp""#, "temp", &DuckDbDialect {})
+        .unwrap();
+    // Original (quoted) spelling preserved.
+    assert_eq!(out, r#""Temp" + "Temp""#);
+}
+
+#[test]
+fn datafusion_keeps_quoted_identifiers_case_sensitive() {
+    // Under the FoldUnquoted policy, quoted "Temp" is a different column from
+    // unquoted temp, so the derivative is 0.
+    let out = Ddx::for_datafusion()
+        .differentiate_sql(r#""Temp" * "Temp""#, "temp", &GenericDialect {})
+        .unwrap();
+    assert_eq!(out, "0.0");
+}
+
+// ---------------------------------------------------------------------------
+// Ambiguity guard (F2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qualified_wrt_across_a_join_is_accepted() {
+    let out = rw("SELECT grad(a.v * b.w, a.v) AS d FROM t a JOIN u b ON a.k = b.k");
+    assert_eq!(out, "SELECT (b.w) AS d FROM t a JOIN u b ON a.k = b.k");
+}
+
+#[test]
+fn fully_qualified_same_name_across_join_is_accepted() {
+    // grad(a.x * b.x, a.x): both occurrences qualified — unambiguous, = b.x.
+    let out = rw("SELECT grad(a.x * b.x, a.x) AS d FROM t a JOIN u b ON a.k = b.k");
+    assert_eq!(out, "SELECT (b.x) AS d FROM t a JOIN u b ON a.k = b.k");
+}
+
+#[test]
+fn bare_occurrence_with_qualified_wrt_errors() {
+    // grad(x * a.x, a.x): bare x might be a.x — demand qualification.
+    let err = Ddx::new()
+        .rewrite_sql("SELECT grad(x * a.x, a.x) FROM t a", &GenericDialect {})
+        .unwrap_err();
+    assert!(matches!(err, DiffError::AmbiguousColumn(_)), "got {err:?}");
+}
+
+#[test]
+fn qualified_occurrence_with_bare_wrt_errors() {
+    // grad(a.x * b.x, x): bare wrt, qualified occurrences — ambiguous.
+    let err = Ddx::new()
+        .rewrite_sql(
+            "SELECT grad(a.x * b.x, x) FROM t a JOIN u b ON a.k = b.k",
+            &GenericDialect {},
+        )
+        .unwrap_err();
+    assert!(matches!(err, DiffError::AmbiguousColumn(_)), "got {err:?}");
+}
+
+#[test]
+fn wrt_must_be_a_bare_column() {
+    let err = Ddx::new()
+        .rewrite_sql("SELECT grad(x * y, x + y) FROM t", &GenericDialect {})
+        .unwrap_err();
+    assert!(matches!(err, DiffError::InvalidMarker(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Projection-boundary guard (F3 / G4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn computed_cte_alias_as_non_wrt_term_errors() {
+    // s = sin(x) is a computed CTE alias; grad(s*x, x) would silently drop ds/dx.
+    let err = Ddx::new()
+        .rewrite_sql(
+            "WITH v AS (SELECT x, sin(x) AS s FROM t) SELECT grad(s * x, x) FROM v",
+            &GenericDialect {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, DiffError::ProjectionBoundary(_)),
+        "got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Through-aggregate differentiation by linearity (design.md §3.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn marker_inside_an_aggregate_is_rewritten() {
+    // One gradient-descent step: the marker goes *inside* the aggregate, and
+    // d/dθ Σ f = Σ ∂f/∂θ is just linearity.
+    let out = rw("SELECT AVG(grad(x * theta, theta)) AS step FROM batch");
+    assert_eq!(out, "SELECT AVG((x)) AS step FROM batch");
+}
+
+#[test]
+fn differentiating_wrt_a_computed_alias_is_allowed() {
+    // Carve-out (G4): when the computed alias IS the wrt, every occurrence is
+    // the leaf, so d/ds (s*s) = 2s is exactly right — no error.
+    let out = rw("SELECT a + b AS s, grad(s * s, s) AS d FROM t");
+    assert_eq!(out, "SELECT a + b AS s, (s + s) AS d FROM t");
+}
