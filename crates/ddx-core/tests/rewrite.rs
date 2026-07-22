@@ -230,6 +230,37 @@ fn marker_inside_an_aggregate_is_rewritten() {
 }
 
 #[test]
+fn qualified_base_column_colliding_with_unrelated_cte_alias_is_accepted() {
+    // Review #42: w.s is table u's own base column, explicitly qualified — it
+    // cannot be v's computed alias `s`, so the guard must NOT fire. Preserves
+    // the qualifier-awareness of the F2 ambiguity guard.
+    let out = rw("WITH v AS (SELECT sin(x) AS s FROM t) \
+         SELECT grad(w.s * x, x) AS d FROM u w JOIN v ON w.k = v.k");
+    assert_eq!(
+        out,
+        "WITH v AS (SELECT sin(x) AS s FROM t) \
+         SELECT (w.s) AS d FROM u w JOIN v ON w.k = v.k"
+    );
+}
+
+#[test]
+fn qualified_reference_to_the_owning_cte_alias_still_errors() {
+    // But v.s IS v's computed alias, so differentiating it as a non-wrt term
+    // still crosses the projection boundary and must error.
+    let err = Ddx::new()
+        .rewrite_sql(
+            "WITH v AS (SELECT sin(x) AS s FROM t) \
+             SELECT grad(v.s * x, x) AS d FROM v",
+            &GenericDialect {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, DiffError::ProjectionBoundary(_)),
+        "got {err:?}"
+    );
+}
+
+#[test]
 fn differentiating_wrt_a_computed_alias_is_allowed() {
     // Carve-out (G4): when the computed alias IS the wrt, every occurrence is
     // the leaf, so d/ds (s*s) = 2s is exactly right — no error.

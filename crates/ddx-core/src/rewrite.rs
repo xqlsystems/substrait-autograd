@@ -91,11 +91,7 @@ fn pre_gate_hit(sql: &str) -> bool {
             }
 
             // The next non-whitespace character must be `(`.
-            if sql[idx + kw.len()..]
-                .chars()
-                .find(|c| !c.is_whitespace())
-                == Some('(')
-            {
+            if sql[idx + kw.len()..].chars().find(|c| !c.is_whitespace()) == Some('(') {
                 return true;
             }
         }
@@ -121,7 +117,7 @@ pub(crate) fn rewrite_sql(
 
     // 3. Statement-level context for the projection-boundary guard (F3/G4):
     //    the names of every *computed* select-list alias of a CTE/derived table.
-    let mut aliases = HashSet::new();
+    let mut aliases = ComputedAliases::default();
     for stmt in &statements {
         collect_computed_aliases(stmt, &mut aliases);
     }
@@ -172,7 +168,7 @@ fn differentiate_marker_tree(
     marker_expr: &Expr,
     casing: IdentCasing,
     reg: &RuleRegistry,
-    aliases: &HashSet<String>,
+    aliases: &ComputedAliases,
 ) -> Result<String> {
     let mut clone = marker_expr.clone();
     let mut rw = MarkerRewriter {
@@ -191,7 +187,7 @@ fn reprint_fallback(
     mut statements: Vec<Statement>,
     casing: IdentCasing,
     reg: &RuleRegistry,
-    aliases: &HashSet<String>,
+    aliases: &ComputedAliases,
 ) -> Result<String> {
     for stmt in &mut statements {
         let mut rw = MarkerRewriter {
@@ -254,7 +250,7 @@ fn differentiate_marker(f: &Function, casing: IdentCasing, reg: &RuleRegistry) -
 /// expression as a constant and drop gradient terms. The carve-out (G4): when
 /// the alias *is* the `wrt` itself, every occurrence is the differentiation
 /// leaf, so no term can be dropped and the guard stays quiet.
-fn projection_guard(f: &Function, aliases: &HashSet<String>) -> Result<()> {
+fn projection_guard(f: &Function, aliases: &ComputedAliases) -> Result<()> {
     if aliases.is_empty() {
         return Ok(());
     }
@@ -273,11 +269,23 @@ fn projection_guard(f: &Function, aliases: &HashSet<String>) -> Result<()> {
     let _ = Visit::visit(*expr_arg, &mut cols);
     for c in cols.cols {
         let lname = c.name.value.to_ascii_lowercase();
-        // Carve-out: the wrt itself is always a leaf; never an error.
+        // Carve-out (G4): the wrt itself is always a leaf; never an error.
         if Some(&lname) == wrt_name.as_ref() {
             continue;
         }
-        if aliases.contains(&lname) {
+        let is_boundary = match &c.qualifier {
+            // A bare occurrence could bind to any computed alias in scope.
+            None => aliases.bare.contains(&lname),
+            // A qualified occurrence crosses a projection boundary only if the
+            // qualifier names the relation that actually owns the alias. A base
+            // column qualified to an unrelated table (e.g. `w.s` when the alias
+            // `s` belongs to a different CTE) is NOT the alias — preserving the
+            // qualifier-awareness the F2 ambiguity guard is built on.
+            Some(q) => aliases
+                .qualified
+                .contains(&(q.value.to_ascii_lowercase(), lname.clone())),
+        };
+        if is_boundary {
             return Err(DiffError::ProjectionBoundary(format!(
                 "`{}` is a computed select-list alias of a CTE/derived table used \
                  as a non-differentiation term; grad does not see through the \
@@ -327,7 +335,7 @@ impl Visitor for MarkerCollector {
 struct MarkerRewriter<'a> {
     casing: IdentCasing,
     reg: &'a RuleRegistry,
-    aliases: &'a HashSet<String>,
+    aliases: &'a ComputedAliases,
 }
 
 impl VisitorMut for MarkerRewriter<'_> {
@@ -379,52 +387,81 @@ impl Visitor for ColumnCollector {
 // Computed-alias collection for the projection-boundary guard
 // ---------------------------------------------------------------------------
 
-fn collect_computed_aliases(stmt: &Statement, out: &mut HashSet<String>) {
+/// The *computed* select-list aliases of the CTEs/derived tables in a
+/// statement, recorded so the guard can distinguish a reference that crosses a
+/// projection boundary from a same-named base column that does not.
+#[derive(Default)]
+struct ComputedAliases {
+    /// Alias names referenceable by a *bare* (unqualified) occurrence.
+    bare: HashSet<String>,
+    /// `(owning relation name, alias name)` for CTE/derived-table computed
+    /// aliases — so a *qualified* occurrence `rel.alias` is matched only against
+    /// the relation that actually owns it. This is what keeps a base column
+    /// like `w.s` from colliding with an unrelated CTE alias `s` (F2's
+    /// qualifier-awareness, applied to the F3/G4 guard).
+    qualified: HashSet<(String, String)>,
+}
+
+impl ComputedAliases {
+    fn is_empty(&self) -> bool {
+        self.bare.is_empty() && self.qualified.is_empty()
+    }
+}
+
+fn collect_computed_aliases(stmt: &Statement, out: &mut ComputedAliases) {
     match stmt {
-        Statement::Query(q) => walk_query(q, out),
+        Statement::Query(q) => walk_query(q, None, out),
         Statement::Insert(insert) => {
             if let Some(source) = &insert.source {
-                walk_query(source, out);
+                walk_query(source, None, out);
             }
         }
         _ => {}
     }
 }
 
-fn walk_query(q: &Query, out: &mut HashSet<String>) {
+/// `owner` is the name of the relation whose *own* projection aliases we are
+/// collecting (a CTE name, or a derived-table alias) — `None` for the outer
+/// query's own select list, whose aliases can only be referenced bare.
+fn walk_query(q: &Query, owner: Option<&str>, out: &mut ComputedAliases) {
     if let Some(with) = &q.with {
         for cte in &with.cte_tables {
-            walk_query(&cte.query, out);
+            let name = cte.alias.name.value.to_ascii_lowercase();
+            walk_query(&cte.query, Some(&name), out);
         }
     }
-    walk_set_expr(&q.body, out);
+    walk_set_expr(&q.body, owner, out);
 }
 
-fn walk_set_expr(body: &SetExpr, out: &mut HashSet<String>) {
+fn walk_set_expr(body: &SetExpr, owner: Option<&str>, out: &mut ComputedAliases) {
     match body {
-        SetExpr::Select(select) => walk_select(select, out),
-        SetExpr::Query(q) => walk_query(q, out),
+        SetExpr::Select(select) => walk_select(select, owner, out),
+        SetExpr::Query(q) => walk_query(q, owner, out),
         SetExpr::SetOperation { left, right, .. } => {
-            walk_set_expr(left, out);
-            walk_set_expr(right, out);
+            walk_set_expr(left, owner, out);
+            walk_set_expr(right, owner, out);
         }
         _ => {}
     }
 }
 
-fn walk_select(select: &Select, out: &mut HashSet<String>) {
+fn walk_select(select: &Select, owner: Option<&str>, out: &mut ComputedAliases) {
     for item in &select.projection {
         if let SelectItem::ExprWithAlias { expr, alias } = item {
             // A *computed* alias is one whose projected expression is not a
             // plain column reference. `ColRef::from_expr` is the single place
             // that recognizes a column reference (seeing through `Nested`).
             if ColRef::from_expr(expr).is_none() {
-                out.insert(alias.value.to_ascii_lowercase());
+                let name = alias.value.to_ascii_lowercase();
+                if let Some(o) = owner {
+                    out.qualified.insert((o.to_string(), name.clone()));
+                }
+                out.bare.insert(name);
             }
         }
     }
     // Recurse into derived tables (FROM subqueries), which are projection
-    // boundaries too.
+    // boundaries too — a derived table's aliases are owned by its own alias.
     for twj in &select.from {
         walk_table_factor(&twj.relation, out);
         for join in &twj.joins {
@@ -433,12 +470,15 @@ fn walk_select(select: &Select, out: &mut HashSet<String>) {
     }
 }
 
-fn walk_table_factor(tf: &TableFactor, out: &mut HashSet<String>) {
-    if let TableFactor::Derived { subquery, .. } = tf {
-        walk_query(subquery, out);
+fn walk_table_factor(tf: &TableFactor, out: &mut ComputedAliases) {
+    if let TableFactor::Derived {
+        subquery, alias, ..
+    } = tf
+    {
+        let owner = alias.as_ref().map(|a| a.name.value.to_ascii_lowercase());
+        walk_query(subquery, owner.as_deref(), out);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Span (1-based character line/column) → byte offset conversion (G3)

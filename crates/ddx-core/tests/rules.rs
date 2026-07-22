@@ -126,6 +126,25 @@ fn cast_to_non_numeric_type_errors() {
 }
 
 #[test]
+fn abs_derivative_is_portable_and_pins_the_kink_at_zero() {
+    // d/du |u| = sign(u), emitted as a portable CASE (no engine-specific
+    // signum/sign builtin) that pins abs'(0) = 0 on every engine (review #44).
+    let out = d("abs(x)", "x");
+    assert!(
+        !out.to_lowercase().contains("signum"),
+        "must not emit the non-portable signum builtin: {out}"
+    );
+    assert_eq!(
+        out,
+        "CASE WHEN x > 0.0 THEN 1.0 WHEN x < 0.0 THEN -1.0 ELSE 0.0 END"
+    );
+    // Chain rule still applies: d/dx |x*y| = sign(x*y) * y.
+    let chained = d("abs(x * y)", "x");
+    assert!(chained.contains("* y"), "chain rule missing: {chained}");
+    assert!(!chained.to_lowercase().contains("signum"));
+}
+
+#[test]
 fn jvp_seeds_a_tangent_on_one_input() {
     // jvp(x*y, x, dx) = product rule with tangent(x)=dx, tangent(y)=0 = dx*y
     let out = Ddx::new()

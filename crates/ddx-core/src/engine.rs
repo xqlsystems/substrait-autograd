@@ -21,7 +21,7 @@ use sqlparser::ast::{
 
 use crate::colref::{ColRef, IdentCasing, Match};
 use crate::constructors::{
-    add, as_const, div, func, func1, is_zero, mul, neg, num, one, square, sub, zero,
+    add, as_const, div, func, func1, is_zero, mul, neg, num, one, sign, square, sub, zero,
 };
 use crate::error::{DiffError, Result};
 
@@ -100,9 +100,13 @@ impl RuleRegistry {
             "tanh".into(),
             rule(|u| sub(one(), square(func1("tanh", u.clone())))),
         );
-        // Piecewise-linear: derivative is the sign (a pinned kink convention at
-        // 0, differing from jax.grad(abs)(0) — design.md §5, F12).
-        unary.insert("abs".into(), rule(|u| func1("signum", u.clone())));
+        // Piecewise-linear: d/du |u| = sign(u), emitted as a portable CASE that
+        // pins abs'(0) = 0 on every engine (design.md §5, F12). It deliberately
+        // does NOT emit signum()/sign(): DuckDB has no signum (only sign),
+        // DataFusion has no sign (only signum), and signum(0) = 1 — so a bare
+        // builtin would be non-portable AND violate the pinned convention. Note
+        // this pins ddx's own convention; jax.grad(abs)(0) uses a different one.
+        unary.insert("abs".into(), rule(|u| sign(u.clone())));
 
         RuleRegistry { unary }
     }

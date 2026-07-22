@@ -17,8 +17,9 @@
 //!    Without this, a *constructed* `mul(add(a,b), c)` displays as `a + b * c`
 //!    and reparses as the wrong expression — a wrong number in valid SQL (G1).
 
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
+    BinaryOperator, CaseWhen, CastKind, DataType, ExactNumberInfo, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
     UnaryOperator, Value,
 };
@@ -225,6 +226,39 @@ pub fn neg(a: Expr) -> Expr {
 /// `e * e`.
 pub fn square(e: Expr) -> Expr {
     mul(e.clone(), e)
+}
+
+/// The mathematical sign of `u` as a portable `CASE`, pinning `sign(0) = 0` on
+/// every engine: `CASE WHEN u > 0 THEN 1.0 WHEN u < 0 THEN -1.0 ELSE 0.0 END`.
+///
+/// This is the derivative factor for `abs` (`d/du |u| = sign(u)`). It avoids the
+/// engine-specific builtins — DuckDB has only `sign`, DataFusion only `signum`,
+/// and the two disagree at `0` (`signum(0) = 1`) — so the emitted derivative is
+/// both portable across the target engines and *actually* pins the documented
+/// kink convention `abs'(0) = 0` (design.md §5, F12), which a bare `signum(u)`
+/// call did not.
+pub fn sign(u: Expr) -> Expr {
+    let compare = |op: BinaryOperator| Expr::BinaryOp {
+        left: Box::new(u.clone()),
+        op,
+        right: Box::new(zero()),
+    };
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![
+            CaseWhen {
+                condition: compare(BinaryOperator::Gt),
+                result: one(),
+            },
+            CaseWhen {
+                condition: compare(BinaryOperator::Lt),
+                result: num(-1.0),
+            },
+        ],
+        else_result: Some(Box::new(zero())),
+    }
 }
 
 // ---------------------------------------------------------------------------
