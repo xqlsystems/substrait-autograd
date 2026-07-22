@@ -24,3 +24,5 @@ target
 .claude
 .chainlink
 .mcp.json
+# auto-generated from chainlink
+CHANGELOG.md
