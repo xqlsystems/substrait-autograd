@@ -5,14 +5,6 @@ _co-author_: Claude (Opus 4.8, Fable 5), via Claude Code
 _status_: Design — iterating toward implementation
 _last updated_: 2026-07-20
 
-This document describes what `ddx` is and how it works, start to finish, as a
-single design. Every decision below has a story — a bug it fixes, an
-alternative it rejects, a spike that settled it — but that story is not told
-inline. It lives in the **Decision Log** at the end, and each place in the main
-text where it's relevant carries a small tag like `[F1]` or `[S3]` pointing to
-it. You can read the whole design without ever following one of those tags;
-they're there for someone auditing a specific claim, not required reading.
-
 ---
 
 ## 1. What `ddx` is
@@ -25,7 +17,7 @@ SELECT i, grad(x * y, x) AS dfdx, grad(x * y, y) AS dfdy FROM g
 
 and derivatives come back as ordinary columns, evaluated row by row by the
 engine alongside everything else. The destination is training ML models in
-SQL — a differentiable database. It ships as one engine-neutral Rust core with
+SQL — a [differentiable](https://www.youtube.com/watch?v=LNNU33TmBFk) [database](https://www.youtube.com/watch?v=jUe3rvTmv7Q). It ships as one engine-neutral Rust core with
 thin per-engine adapters, into DataFusion (via a Python package, `ddxdb`, into
 [xarray-sql](https://github.com/xqlsystems/xarray-sql)) and DuckDB (via a
 community extension, into
@@ -49,12 +41,12 @@ named for exactly this: trained ML models as differentiable databases, `d/dx`
 of a table.
 
 **Grounding.** The design starts from a working prototype,
-[xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192), which
+[xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192) [3], which
 implements `grad`/`jvp`/`vjp` for DataFusion, and a follow-on demo,
-[xarray-sql#196](https://github.com/xqlsystems/xarray-sql/pull/196), which
+[xarray-sql#196](https://github.com/xqlsystems/xarray-sql/pull/196) [4], which
 trains a real MLP with every gradient computed in SQL. §3 and §4 explain what
 each taught the design and generalize it into a reusable component. Every
-load-bearing claim below that could be checked with a small program was
+foundational claim below that could be checked with a small program was
 checked with one — the programs live in [`spikes/`](../spikes/README.md) and
 are cited by tag throughout.
 
@@ -68,8 +60,7 @@ differentiation engine:
   data — the sweet spot no other SQL-native tool covers. It has a real
   ceiling: an N-parameter gradient computed as N independent scalar
   derivations does not scale, which is the reason ML left symbolic
-  differentiation for reverse-mode AD in the first place (Baydin et al., JMLR
-  2018).
+  differentiation for reverse-mode AD in the first place (Baydin et al. [1]).
 - **v2 — query-level reverse-mode AD** (§4), the ML headline. The scalar
   engine from v1 becomes the *elementwise leaf* of a system that
   differentiates whole queries — not expressions — by applying transpose
@@ -500,7 +491,7 @@ a term appearing k times is recomputed k times unless the engine's own CSE
 catches it. With no reverse-mode accumulation at the scalar layer, an
 N-parameter SGD step is N independent full derivations of the loss per row
 per iteration — precisely why ML left symbolic differentiation for
-reverse-mode AD (Baydin et al., JMLR 2018) `[F6]`/`[F10]`/`[G5]`. v1 accepts
+reverse-mode AD (Baydin et al. [1]) `[F6]`/`[F10]`/`[G5]`. v1 accepts
 this and positions around it (§1) rather than trying to out-engineer it: the
 size/latency cliff gets measured, not guessed, by an explicit benchmark
 (§8); the eventual remedy for very heavy scalar use is a let-binding pass
@@ -549,9 +540,9 @@ elementwise and also passes. LayerNorm (mean/variance = group-reduce +
 elementwise), residual connections (elementwise add), and GELU/ReLU
 (elementwise) all reduce to the same primitive set.
 
-**Published precedent.** Tang et al., *Auto-Differentiation of Relational
-Computations for Very Large Scale Machine Learning* (ICML 2023, PMLR
-202:33581), do exactly this — a functional relational algebra with a
+**Published precedent.** Tang et al. [2], *Auto-Differentiation of Relational
+Computations for Very Large Scale Machine Learning*, do exactly this — a
+functional relational algebra with a
 gradient operator and per-operator relation-Jacobian products for reverse
 mode — and show it performance-competitive at billion-node scale. What
 `ddx` adds: they target a bespoke tensor-relational engine, not portable
@@ -1236,9 +1227,8 @@ ddx marker (pure DuckDB bug) and isolated from DataFusion, which round-trips
 the identical query correctly. A two-step workaround (round-trip only the
 window-column computation, then filter with plain engine-native SQL) is
 verified correct — Route ships on both engines without waiting for an
-upstream fix, though filing the bug against
-`github.com/substrait-io/duckdb-substrait-extension` is still worth doing on
-principle. → §4.3.
+upstream fix, though filing the bug against the DuckDB Substrait extension
+project [5] is still worth doing on principle. → §4.3.
 
 **S5 — Named the recurring risk pattern this reveals.** v2 is bounded by
 whatever relation vocabulary Substrait and each engine's producer/consumer
@@ -1248,3 +1238,41 @@ first concrete instance; more rules (LayerNorm, conv) will likely surface
 more. The resolution pattern each time: spike the forward idiom against
 both engines before trusting a rule, and prefer a verified workaround over
 waiting on an upstream fix when one exists. → §4.2, §4.6, §5.
+
+---
+
+## References
+
+Numbered where cited inline in the design above (e.g. `[1]`); everything
+else the design links to (project pages, tool docs) stays as an ordinary
+inline hyperlink at the point it's used and isn't repeated here.
+
+**Papers**
+
+1. Baydin, A. G., Pearlmutter, B. A., Radul, A., & Siskind, J. M. (2018).
+   *Automatic Differentiation in Machine Learning: a Survey.* Journal of
+   Machine Learning Research, 18(153), 1–43.
+   [arXiv:1502.05767](https://arxiv.org/abs/1502.05767). Cited for the
+   argument that reverse-mode AD displaced symbolic differentiation in ML for
+   exactly the expression-swell reason v1's scalar engine hits (§3.7,
+   Decision Log `F6`/`F10`/`G5`).
+2. Tang et al. (2023). *Auto-Differentiation of Relational Computations for
+   Very Large Scale Machine Learning.* Proceedings of the 40th International
+   Conference on Machine Learning (ICML), PMLR 202:33581.
+   [proceedings.mlr.press/v202/tang23a](https://proceedings.mlr.press/v202/tang23a/tang23a.pdf).
+   The published precedent for v2's per-operator transpose-rule approach —
+   independently arrived at, reviewed after the fact (§4.1).
+
+**Prior work this design is grounded in**
+
+3. [xarray-sql#192](https://github.com/xqlsystems/xarray-sql/pull/192) — the
+   prototype implementing `grad`/`jvp`/`vjp` for DataFusion that §3
+   generalizes into `ddx-core`. All 13 commits, and what was added and then
+   removed, are load-bearing (§3.1).
+4. [xarray-sql#196](https://github.com/xqlsystems/xarray-sql/pull/196) — the
+   MLP-trained-in-SQL demo (`nn.py`) that motivates v2 and that §4's
+   transpose rules are checked against, query-shape for query-shape (§4.5).
+5. [substrait-io/duckdb-substrait-extension](https://github.com/substrait-io/duckdb-substrait-extension) —
+   DuckDB's community Substrait extension. The round-trip bug found in
+   Decision Log `S4` (`spikes/duckdb_substrait_window_bug.py`) should be
+   filed against this project.
