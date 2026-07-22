@@ -321,8 +321,16 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
     let base = args[0];
     let exponent = args[1];
     match (as_const(base), as_const(exponent)) {
-        // Constant exponent (covers x^2, x^0.5, ...).
+        // Constant exponent (covers x^2, x^0.5, x^-2, ...).
         (_, Some(c)) => {
+            // A non-finite constant (e.g. an out-of-range literal `1e400`) would
+            // otherwise be emitted as an `inf`/`NaN` token — invalid SQL. Fail
+            // loud instead (#33).
+            if !c.is_finite() {
+                return Err(DiffError::NotImplemented(format!(
+                    "power(base, {c}): a non-finite constant exponent is not differentiable"
+                )));
+            }
             let dbase = linearize(base, leaf, reg)?;
             if is_zero(&dbase) {
                 return Ok(zero());
@@ -336,9 +344,19 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
             if is_zero(&dexp) {
                 return Ok(zero());
             }
+            // The derivative is `a^u · ln(a) · du`; `ln(a)` is non-finite for a
+            // non-positive (or infinite) base, which would emit an `inf`/`NaN`
+            // token. Fail loud rather than emit invalid SQL (#33).
+            let ln_a = a.ln();
+            if !ln_a.is_finite() {
+                return Err(DiffError::NotImplemented(format!(
+                    "power({a}, exponent): the derivative needs ln(base), but ln({a}) is \
+                     not finite — the constant base must be positive"
+                )));
+            }
             let outer = mul(
                 func("power", vec![base.clone(), exponent.clone()]),
-                num(a.ln()),
+                num(ln_a),
             );
             Ok(mul(outer, dexp))
         }
@@ -351,13 +369,16 @@ fn linearize_power(name: &str, args: &[&Expr], leaf: &Leaf, reg: &RuleRegistry) 
     }
 }
 
-/// The simple (last-part, lower-cased) name of a function call, if its name is
-/// a plain identifier path.
+/// The lower-cased name of a function call — but only for an **unqualified**
+/// call (a single-identifier name), mirroring the marker path's strict
+/// `len() == 1` (F8). A schema-qualified call like `myschema.sin(x)` may be an
+/// unrelated user function, so it must not silently match the built-in `sin`
+/// rule ("tag explicitly, never infer" — principle 3; round-3 review #47).
 fn simple_func_name(f: &Function) -> Option<String> {
-    f.name.0.last().and_then(|part| match part {
-        ObjectNamePart::Identifier(id) => Some(id.value.to_ascii_lowercase()),
+    match f.name.0.as_slice() {
+        [ObjectNamePart::Identifier(id)] => Some(id.value.to_ascii_lowercase()),
         _ => None,
-    })
+    }
 }
 
 /// The positional (unnamed) argument expressions of a function call, or `None`

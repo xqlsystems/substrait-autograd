@@ -12,7 +12,7 @@ use std::ops::ControlFlow;
 use ddx_core::sqlparser::ast::{Expr, Ident, VisitMut, VisitorMut};
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
-use ddx_core::Ddx;
+use ddx_core::{ColRef, Ddx};
 
 /// Remove every `Expr::Nested` wrapper so two trees that differ only in
 /// (redundant or precedence) parentheses compare equal.
@@ -44,30 +44,24 @@ fn parse(text: &str) -> Expr {
         .unwrap_or_else(|e| panic!("reparse of `{text}` failed: {e}"))
 }
 
-/// For a derivative produced from `expr`/`wrt`, assert that rendering it and
-/// reparsing yields the same AST modulo `Nested` — i.e. the precedence
-/// parentheses the smart constructors emit are exactly the ones the grammar
-/// needs, no more, no fewer.
+/// The load-bearing invariant (design.md §5): rendering the *constructed*
+/// derivative AST `d` and reparsing it must yield the same AST, **modulo
+/// `Nested`**. This compares against `d` itself (via [`Ddx::differentiate`],
+/// which returns the AST) — not against another parse of the rendered text,
+/// which would be vacuously equal and hide a constructed-vs-parsed mismatch
+/// such as a negative literal emitted as `Value("-1.0")` (round-3 review #46).
 fn assert_roundtrips(expr: &str, wrt: &str) {
     let ddx = Ddx::new();
-    // The derivative as text, via the public path...
-    let rendered = ddx
-        .differentiate_sql(expr, wrt, &GenericDialect {})
-        .unwrap_or_else(|e| panic!("differentiate_sql({expr}, {wrt}): {e}"));
-    // ...reparsed, then rendered a second time: must be a fixed point (the
-    // parentheses are stable) and structurally identical modulo Nested.
+    let d = ddx
+        .differentiate(&parse(expr), &ColRef::bare(wrt))
+        .unwrap_or_else(|e| panic!("differentiate d/d{wrt} ({expr}): {e}"));
+    let rendered = d.to_string();
     let reparsed = parse(&rendered);
-    let rerendered = ddx
-        .differentiate_sql(expr, wrt, &GenericDialect {})
-        .unwrap();
     assert_eq!(
-        rendered, rerendered,
-        "render is not idempotent for d/d{wrt} ({expr})"
+        strip(reparsed),
+        strip(d),
+        "reparse(render(d)) != d modulo Nested for d/d{wrt} ({expr}); rendered = {rendered}"
     );
-    // The load-bearing check: reparse(render(d)) == d, modulo parentheses.
-    let a = strip(reparsed);
-    let b = strip(parse(&rendered));
-    assert_eq!(a, b, "round-trip changed the tree for d/d{wrt} ({expr})");
 }
 
 #[test]
@@ -84,6 +78,18 @@ fn precedence_sensitive_derivatives_round_trip() {
     assert_roundtrips("sqrt(x * x + y * y)", "x"); // nested composite
     assert_roundtrips("a * b * c * d", "a"); // n-factor product (swell shape)
     assert_roundtrips("exp(x) / (x - 1)", "x"); // quotient with composite denom
+}
+
+#[test]
+fn negative_literal_derivatives_round_trip() {
+    // The cases the original 10 avoided — every one emits a negative literal,
+    // which must be a `UnaryOp{Minus, ..}` (matching sqlparser's parse), not a
+    // `Value("-…")` that would reparse to a different tree (#46).
+    assert_roundtrips("abs(x)", "x"); // CASE ... THEN -1.0 ...
+    assert_roundtrips("power(x, -2)", "x"); // -2 * power(x, -3.0)
+    assert_roundtrips("power(x, 0.5)", "x"); // emits exponent -0.5
+    assert_roundtrips("x / y", "y"); // negative numerator, -(x)/(y*y)
+    assert_roundtrips("cos(x) * x", "x"); // -sin(x) * x + cos(x)
 }
 
 #[test]

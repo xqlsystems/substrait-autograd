@@ -40,6 +40,17 @@ fn marker_free_query_is_untouched() {
 }
 
 #[test]
+fn marker_free_query_mentioning_grad_in_a_string_is_returned_verbatim() {
+    // The pre-gate matches the `grad(` substring even inside a string literal,
+    // so this statement *is* parsed (unlike the case above). With no real
+    // marker it must still return byte-identical: a pre-gate false positive
+    // costs only a parse that finds nothing, never a wrong rewrite (review #45,
+    // finding D).
+    let sql = "SELECT 'grad(' AS label FROM t";
+    assert_eq!(rw(sql), sql);
+}
+
+#[test]
 fn nested_higher_order_grad() {
     // grad(grad(power(x,3), x), x) = d2/dx2 x^3 = 6x; inner differentiated first.
     let out = rw("SELECT grad(grad(power(x, 3), x), x) AS d FROM t");

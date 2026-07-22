@@ -28,20 +28,53 @@ use sqlparser::ast::{
 // Literals and constant inspection
 // ---------------------------------------------------------------------------
 
-/// Format an `f64` as a SQL numeric literal that always carries a decimal point
-/// (or exponent), so it reads as floating-point rather than an integer literal.
+/// Format a *finite, non-negative* `f64` as the digits of a SQL numeric literal,
+/// always with a decimal point (or exponent) so it reads as floating-point.
+/// Negativity is represented structurally by [`num`] (as a unary minus), not in
+/// the digits — so this never emits a leading `-`.
 fn format_f64(v: f64) -> String {
+    debug_assert!(
+        v.is_finite() && v >= 0.0,
+        "format_f64 expects a finite, non-negative value (got {v})"
+    );
     let s = format!("{v}");
-    if s.contains(['.', 'e', 'E']) || s.contains("inf") || s.contains("NaN") {
+    if s.contains(['.', 'e', 'E']) {
         s
     } else {
         format!("{s}.0")
     }
 }
 
-/// A numeric literal expression for `v` (e.g. `1.0`, `2.0`, `0.6931471805599453`).
-pub fn num(v: f64) -> Expr {
+/// A bare numeric-literal expression for the finite, non-negative value `v`.
+fn raw_num(v: f64) -> Expr {
     Expr::Value(Value::Number(format_f64(v), false).with_empty_span())
+}
+
+/// A numeric literal expression for the finite value `v` (e.g. `1.0`, `2.0`,
+/// `0.6931471805599453`).
+///
+/// A negative value is emitted as a *unary minus* applied to the magnitude
+/// (`-1.0` ⇒ `UnaryOp{Minus, 1.0}`) — exactly the AST shape `sqlparser` produces
+/// when it parses `-1.0`. This is what makes the §5 round-trip invariant
+/// (`reparse(render(d)) == d` modulo `Nested`) hold for negative literals too;
+/// emitting a `Value("-1.0")` would reparse to a `UnaryOp` and break it
+/// (round-3 review #46).
+///
+/// `v` must be finite: the only user-derived numbers that reach `num` come
+/// through the `power` rule, which guards `ln(base)`/overflow before calling
+/// (so a non-finite value here is a caller bug, not user input — #33).
+pub fn num(v: f64) -> Expr {
+    debug_assert!(v.is_finite(), "num expects a finite value (got {v})");
+    if v < 0.0 {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: Box::new(raw_num(-v)),
+        }
+    } else {
+        // `+0.0` and `-0.0` both land here (`-0.0 < 0.0` is false); normalize so
+        // `-0.0` never renders as the literal `-0.0`.
+        raw_num(if v == 0.0 { 0.0 } else { v })
+    }
 }
 
 /// The constant `0.0` — the derivative of anything independent of `wrt`.
@@ -65,6 +98,18 @@ pub fn as_const(e: &Expr) -> Option<f64> {
             _ => None,
         },
         Expr::Nested(inner) => as_const(inner),
+        // `sqlparser` parses a negative literal `-2` as `UnaryOp{Minus,
+        // Value("2")}`, not `Value("-2")` — so a negated constant must be seen
+        // through here, or the `power` rule misclassifies a constant exponent
+        // like `-2` as variable and wrongly rejects `power(x, -2)` (#46).
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => as_const(expr).map(|v| -v),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => as_const(expr),
         _ => None,
     }
 }

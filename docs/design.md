@@ -263,11 +263,18 @@ construct could otherwise produce a wrong number instead of an error):
   unqualified calls (`myschema.grad(…)` is left alone) and matched
   case-folded, so `GRAD(x,x)` is caught too `[F8]`/`[G7]`.
 - **Splice by source span, never reprint the statement.** `rewrite_sql`
-  first runs a parse-free, case-insensitive pre-gate — a regex over
-  `grad`/`jvp\(` — and returns the input verbatim if it doesn't hit, so a
-  marker-free statement is *never parsed* and can't be failed or reformatted
-  by parser coverage gaps. When the gate hits, only the marker call's byte
-  range is replaced, everything else stays byte-identical. This is a real
+  first runs a parse-free, case-insensitive pre-gate — a scan for an
+  unqualified `grad`/`jvp\(` substring — and returns the input verbatim if it
+  doesn't hit, so a statement whose text contains no such substring is *never
+  parsed* and can't be failed or reformatted by parser coverage gaps. The gate
+  is a substring filter, so it also hits on a `grad(` that appears only inside
+  a string literal or comment: such a statement *is* parsed, but with no real
+  marker it still comes back verbatim (the collector finds nothing) — a
+  false-positive costs a parse, never a wrong rewrite. The one residual is a
+  marker-free statement that both mentions the substring *and* uses syntax the
+  dialect can't parse: it would hard-error where a stricter gate wouldn't
+  (documentation-only, `[F5]`). When the gate hits a real marker, only the
+  marker call's byte range is replaced, everything else stays byte-identical. This is a real
   subsystem, not a one-liner: `sqlparser`'s `Spanned` gives line/column in
   1-based *characters*, not byte offsets, so the splice needs a
   UTF-8-aware conversion, must handle multiple and nested markers (spliced
@@ -292,8 +299,10 @@ follows) but a narrower one than first assumed: spiked against `DuckDbDialect`
 @ `sqlparser` 0.62.0, `SELECT * EXCLUDE`, `FROM`-first queries, bare `FROM t`,
 lambdas, and `t.* REPLACE (…)` all parse; the real misses are `PIVOT` and `#1`
 positional columns `[G9]`. The parse-free pre-gate and source-span splicing
-above (§3.2) mean this coverage gap only ever bounds a query that *actually
-contains* a marker, and reprint fidelity is never a separate risk.
+above (§3.2) mean this coverage gap only ever bounds a query whose text
+*contains a `grad(`/`jvp(` substring* — almost always a real marker, but also
+the rare false positive where the substring sits inside a string literal or
+comment (§3.2) — and reprint fidelity is never a separate risk.
 
 **Path B — in-engine plan rewrite, native Rust DataFusion.** A marker UDF plus
 an `AnalyzerRule` so `grad()` works bare, with no wrapper, across both the SQL

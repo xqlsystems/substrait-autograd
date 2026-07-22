@@ -7,7 +7,7 @@
 //! `Nested`-wrapped for precedence safety (G1). Both are asserted here.
 
 use ddx_core::sqlparser::dialect::GenericDialect;
-use ddx_core::Ddx;
+use ddx_core::{Ddx, DiffError};
 
 fn d(expr: &str, wrt: &str) -> String {
     Ddx::new()
@@ -86,6 +86,66 @@ fn unsupported_function_errors() {
     assert!(Ddx::new()
         .differentiate_sql("atan2(x, y)", "x", &GenericDialect {})
         .is_err());
+}
+
+#[test]
+fn power_negative_constant_exponent() {
+    // d/dx power(x, -2) = -2 * power(x, -3); a negative constant exponent is
+    // inside the stated v1 surface and must not be rejected (review #46).
+    assert_eq!(d("power(x, -2)", "x"), "-2.0 * power(x, -3.0)");
+}
+
+#[test]
+fn power_negative_fractional_exponent() {
+    // d/dx power(x, -0.5) = -0.5 * power(x, -1.5); the negative *fractional*
+    // case, complementing the -2 integer case above (review #46).
+    assert_eq!(d("power(x, -0.5)", "x"), "-0.5 * power(x, -1.5)");
+}
+
+#[test]
+fn power_fractional_exponent_output_is_reconsumable() {
+    // d/dx power(x, 0.5) emits a negative exponent; differentiating that TEXT
+    // again must work (the engine must be able to re-consume its own output).
+    let once = d("power(x, 0.5)", "x");
+    assert!(once.contains("power(x, -0.5)"), "unexpected: {once}");
+    // Re-parse and differentiate the emitted text again — no error.
+    let twice = Ddx::new().differentiate_sql(&once, "x", &GenericDialect {});
+    assert!(twice.is_ok(), "engine rejected its own output: {twice:?}");
+}
+
+#[test]
+fn power_non_positive_constant_base_errors() {
+    // d/dx power(0, x) would need ln(0) = -inf; must fail loud, not emit
+    // "power(0, x) * -inf" (review #33).
+    let err = Ddx::new()
+        .differentiate_sql("power(0, x)", "x", &GenericDialect {})
+        .unwrap_err();
+    assert!(matches!(err, DiffError::NotImplemented(_)), "got {err:?}");
+    let out = Ddx::new().differentiate_sql("power(2, x)", "x", &GenericDialect {});
+    assert!(out.is_ok(), "positive base should differentiate: {out:?}");
+    assert!(!out.unwrap().to_lowercase().contains("inf"));
+}
+
+#[test]
+fn power_non_finite_constant_exponent_errors() {
+    // The mirror of the non-positive-base guard, on the exponent side: an
+    // out-of-range literal exponent (1e400 overflows f64 to +inf) must fail
+    // loud rather than emit an `inf` token (review #33).
+    let err = Ddx::new()
+        .differentiate_sql("power(x, 1e400)", "x", &GenericDialect {})
+        .unwrap_err();
+    assert!(matches!(err, DiffError::NotImplemented(_)), "got {err:?}");
+}
+
+#[test]
+fn schema_qualified_call_does_not_match_builtin_rule() {
+    // myschema.sin(x) may be an unrelated user function; it must NOT silently
+    // differentiate via the built-in sin rule (review #47).
+    assert!(Ddx::new()
+        .differentiate_sql("myschema.sin(x)", "x", &GenericDialect {})
+        .is_err());
+    // The unqualified builtin still works.
+    assert_eq!(d("sin(x)", "x"), "cos(x)");
 }
 
 #[test]
