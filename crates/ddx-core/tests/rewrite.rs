@@ -111,6 +111,43 @@ fn splice_preserves_exact_surrounding_bytes() {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-gate coverage: comment-separated markers (KNOWN BUG #52)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "known bug #52: pre-gate skips only whitespace, not SQL comments, so \
+            a comment-separated marker is missed and returned verbatim"]
+fn pre_gate_must_not_miss_a_comment_separated_marker() {
+    // A SQL comment is lexical whitespace, so `grad /* c */ (x, x)` parses as a
+    // genuine `Function(name=grad)` marker call — the *same* AST as plain
+    // `grad(x, x)`. The whitespace-separated forms below ARE rewritten, proving
+    // the marker is real and reachable; the comment-separated forms must be too.
+    //
+    // But `pre_gate_hit` requires the next *non-whitespace* char after the name
+    // to be `(` and does not skip comments, so these slip past the parse-free
+    // gate and `rewrite_sql` returns them VERBATIM — the marker survives to
+    // execution un-rewritten. This is a false-NEGATIVE missing a REAL marker,
+    // contradicting design.md §3.2's guarantee that the gate only ever produces
+    // harmless false-positives.
+
+    // Baseline: whitespace-separated markers are correctly rewritten to (1.0).
+    assert_eq!(rw("SELECT grad\n(x, x) FROM t"), "SELECT (1.0) FROM t");
+    assert_eq!(rw("SELECT grad\t(x, x) FROM t"), "SELECT (1.0) FROM t");
+
+    // The bug: a comment between the name and its argument list.
+    assert_eq!(
+        rw("SELECT grad /* c */ (x, x) FROM t"),
+        "SELECT (1.0) FROM t",
+        "block-comment-separated marker was not rewritten"
+    );
+    assert_eq!(
+        rw("SELECT grad-- c\n(x, x) FROM t"),
+        "SELECT (1.0) FROM t",
+        "line-comment-separated marker was not rewritten"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Reserved names (F8) and the cut of scalar vjp (Q7)
 // ---------------------------------------------------------------------------
 
