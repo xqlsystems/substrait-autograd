@@ -11,7 +11,6 @@ members = [
     "crates/ddx-core",
     "crates/ddx-ad",
     "crates/ddx-datafusion",
-    "crates/ddx-duckdb",
 ]
 
 [workspace.package]

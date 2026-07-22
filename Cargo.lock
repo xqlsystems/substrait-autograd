@@ -46,13 +46,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ddx-duckdb"
-version = "0.0.0"
-dependencies = [
- "ddx-core",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
