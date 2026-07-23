@@ -90,13 +90,64 @@ fn pre_gate_hit(sql: &str) -> bool {
                 continue;
             }
 
-            // The next non-whitespace character must be `(`.
-            if sql[idx + kw.len()..].chars().find(|c| !c.is_whitespace()) == Some('(') {
+            // The next significant character must be `(`. sqlparser treats a SQL
+            // comment as lexical whitespace, so `grad /* c */ (x, x)` and
+            // `grad-- c\n(x, x)` are genuine marker calls — the scan skips
+            // comments as well as whitespace, or the gate would miss them and
+            // let a real marker reach execution un-rewritten (#52).
+            let after = &sql[idx + kw.len()..];
+            if after[skip_trivia(after)..].starts_with('(') {
                 return true;
             }
         }
     }
     false
+}
+
+/// Byte offset of the first significant character in `s`, skipping leading
+/// whitespace and SQL comments (`-- … end-of-line`, and `/* … */` block
+/// comments, which nest in Postgres/DuckDB) — the trivia sqlparser's tokenizer
+/// discards. Returns `s.len()` if the rest is all trivia.
+///
+/// Delimiters (`-`, `/`, `*`, whitespace, `\n`) are all ASCII, and a UTF-8
+/// continuation byte is never equal to an ASCII byte, so scanning by bytes is
+/// safe even with multibyte text inside a comment.
+fn skip_trivia(s: &str) -> usize {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    loop {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Line comment: `--` to end of line (or input).
+        if i + 1 < n && b[i] == b'-' && b[i + 1] == b'-' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: `/* … */`, nesting-aware.
+        if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < n && depth > 0 {
+                if i + 1 < n && b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < n && b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    i
 }
 
 /// The public entry point behind [`crate::Ddx::rewrite_sql`].

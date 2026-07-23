@@ -111,12 +111,10 @@ fn splice_preserves_exact_surrounding_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-gate coverage: comment-separated markers (KNOWN BUG #52)
+// Pre-gate coverage: comment-separated markers (#52, fixed)
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "known bug #52: pre-gate skips only whitespace, not SQL comments, so \
-            a comment-separated marker is missed and returned verbatim"]
 fn pre_gate_must_not_miss_a_comment_separated_marker() {
     // A SQL comment is lexical whitespace, so `grad /* c */ (x, x)` parses as a
     // genuine `Function(name=grad)` marker call — the *same* AST as plain
