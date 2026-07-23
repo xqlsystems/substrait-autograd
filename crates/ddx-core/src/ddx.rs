@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
 //
 // SPDX-License-Identifier: Apache-2.0
 
