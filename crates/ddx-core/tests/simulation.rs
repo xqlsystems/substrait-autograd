@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+// SPDX-FileCopyrightText: 2026 Alexander Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Simulation / property-based tests for the v1 differentiation engine
 //! (design.md §5: "numeric agreement" + "round-trip property tests").
 //!
@@ -516,6 +521,184 @@ fn self_consumption_failure(ddx: &Ddx, wrt: &ColRef, original: &str) -> Option<S
     None
 }
 
+// ---------------------------------------------------------------------------
+// Property 4: `rewrite_sql` splice fidelity (design.md §3.2, G3/F5).
+// ---------------------------------------------------------------------------
+//
+// The three properties above drive `differentiate` on bare expressions; none of
+// them exercise `rewrite_sql` — the parse-free pre-gate, the UTF-8-aware source
+// span → byte-offset splice, multiple/nested markers, or the marker-free
+// identity guarantee. That subsystem is exactly where bug #52 lived. The
+// invariant here is *structural* (byte-level), not numeric: rewriting a marker
+// statement must replace **only** each marker's span with `(derivative)` and
+// leave every other byte identical.
+
+/// Valid SELECT-list prefixes to place before a marker. Several carry multibyte
+/// characters (in string literals / comments) *before* the marker, so the
+/// marker's character-column no longer equals its byte offset — the case the
+/// `locate` char→byte conversion (G3) must get right.
+const STMT_PREFIXES: &[&str] = &[
+    "SELECT ",
+    "SELECT x, ",
+    "SELECT 'héllo', ",
+    "SELECT 'naïve café ☕' AS greeting, ",
+    "SELECT /* café ☕ */ ",
+    "SELECT   ",
+    "SELECT y AS why, ",
+];
+
+/// Valid statement tails (ASCII identifiers only — unicode kept to string
+/// literals/comments, since unquoted-identifier unicode support is dialect-
+/// dependent and not what this fuzz is testing).
+const STMT_SUFFIXES: &[&str] = &[
+    " FROM t",
+    " AS d FROM t",
+    " FROM data",
+    " AS d FROM t WHERE label <> 'niño'",
+    "",
+];
+
+/// Valid separators between two markers — as sibling select items (`, `) or
+/// inside one arithmetic select item (` + `, ` * `).
+const STMT_MIDS: &[&str] = &[", ", " + ", " * ", ", z, "];
+
+/// Whether the splice fuzz generates `jvp` markers. Temporarily `false`:
+/// `jvp` with a compound/casted tangent trips bug #57 (`rewrite_sql`
+/// under-splices a marker whose last-arg tail is a `CAST`/`Nested`, because
+/// sqlparser's span under-reports there), which would make the bounded and soak
+/// tests permanently red. `grad`/nested markers are immune (their last arg is
+/// the bare wrt column). Flip to `true` when #57 is fixed — the minimal repro is
+/// `splice_handles_marker_with_cast_or_nested_tail` (`#[ignore]`).
+const SPLICE_FUZZ_INCLUDES_JVP: bool = false;
+
+/// Build one marker call and the exact text `rewrite_sql` must splice in its
+/// place (`(derivative)`), or `None` if the marker's derivative is undefined
+/// (in which case `rewrite_sql` must error on the whole statement).
+fn gen_marker_segment(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
+    let wrt = if rng.below(2) == 0 { "x" } else { "y" };
+    let wrt_col = ColRef::bare(wrt);
+    let depth = 2 + rng.below(2) as u32;
+    let expr_text = gen_expr(rng, depth);
+    let expr = parse_expr(&expr_text);
+
+    match rng.below(3) {
+        // Nested higher-order: grad(grad(expr, wrt), wrt).
+        0 => {
+            let marker = format!("grad(grad({expr_text}, {wrt}), {wrt})");
+            let repl = ddx
+                .differentiate(&expr, &wrt_col)
+                .and_then(|d1| ddx.differentiate(&d1, &wrt_col))
+                .ok()
+                .map(|dd| format!("({dd})"));
+            (marker, repl)
+        }
+        // jvp(expr, wrt, tangent) — only when enabled (bug #57).
+        1 if SPLICE_FUZZ_INCLUDES_JVP => {
+            let tan_depth = 1 + rng.below(2) as u32;
+            let tan_text = gen_expr(rng, tan_depth);
+            let tan = parse_expr(&tan_text);
+            let marker = format!("jvp({expr_text}, {wrt}, {tan_text})");
+            match ddx.jvp(&expr, &[(wrt_col, tan)]) {
+                Ok(v) => (marker, Some(format!("({v})"))),
+                Err(_) => (marker, None),
+            }
+        }
+        // grad(expr, wrt)
+        _ => {
+            let marker = format!("grad({expr_text}, {wrt})");
+            match ddx.differentiate(&expr, &wrt_col) {
+                Ok(d) => (marker, Some(format!("({d})"))),
+                Err(_) => (marker, None),
+            }
+        }
+    }
+}
+
+/// Property 4a: assemble a statement with 1–3 markers wrapped in random
+/// (Unicode-bearing) scaffolding and assert `rewrite_sql` splices each marker
+/// exactly, byte-for-byte, leaving all surrounding text untouched. If any
+/// marker's derivative is undefined, the whole rewrite must error instead.
+fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let n = 1 + rng.below(3) as usize;
+    let prefix = STMT_PREFIXES[rng.below(STMT_PREFIXES.len() as u64) as usize];
+    let suffix = STMT_SUFFIXES[rng.below(STMT_SUFFIXES.len() as u64) as usize];
+
+    let mut input = String::from(prefix);
+    let mut expected = String::from(prefix);
+    let mut any_undefined = false;
+    for i in 0..n {
+        if i > 0 {
+            let mid = STMT_MIDS[rng.below(STMT_MIDS.len() as u64) as usize];
+            input.push_str(mid);
+            expected.push_str(mid);
+        }
+        let (marker, repl) = gen_marker_segment(rng, ddx);
+        input.push_str(&marker);
+        match repl {
+            Some(r) => expected.push_str(&r),
+            None => any_undefined = true,
+        }
+    }
+    input.push_str(suffix);
+    expected.push_str(suffix);
+
+    let got = ddx.rewrite_sql(&input, &GenericDialect {});
+    if any_undefined {
+        // At least one marker's derivative is undefined → the whole rewrite must
+        // fail loud, never partially rewrite.
+        return match got {
+            Err(_) => None,
+            Ok(o) => Some(format!(
+                "[splice] expected an error (a marker derivative is undefined) but got Ok:\n  input  = {input}\n  output = {o}"
+            )),
+        };
+    }
+    match got {
+        Ok(o) if o == expected => None,
+        Ok(o) => Some(format!(
+            "[splice] rewrite_sql splice mismatch:\n  input    = {input}\n  expected = {expected}\n  actual   = {o}"
+        )),
+        Err(e) => Some(format!(
+            "[splice] rewrite_sql errored on a valid marker statement:\n  input = {input}\n  error = {e}"
+        )),
+    }
+}
+
+/// A marker-free statement — some deliberately containing a `grad(`/`jvp(`
+/// substring inside a string literal, a comment, or a *qualified* call, so the
+/// pre-gate's substring filter hits and the statement is parsed but no real
+/// marker is found. Every one must come back byte-identical.
+fn gen_marker_free_stmt(rng: &mut Rng) -> String {
+    match rng.below(6) {
+        0 => {
+            let depth = 2 + rng.below(2) as u32;
+            format!("SELECT {} FROM t", gen_expr(rng, depth))
+        }
+        1 => "SELECT 'grad(x, x)' AS s FROM t".to_string(),
+        2 => "SELECT x /* grad(y, y) */ FROM t".to_string(),
+        3 => "SELECT myschema.grad(x, x) AS d FROM t".to_string(),
+        4 => "SELECT 'jvp(sin(x), x, dx)' AS label, x FROM t".to_string(),
+        _ => format!(
+            "SELECT {} AS val FROM t WHERE label <> 'grad('",
+            gen_expr(rng, 2)
+        ),
+    }
+}
+
+/// Property 4b: a marker-free statement is returned byte-identical.
+fn marker_free_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let s = gen_marker_free_stmt(rng);
+    match ddx.rewrite_sql(&s, &GenericDialect {}) {
+        Ok(o) if o == s => None,
+        Ok(o) => Some(format!(
+            "[identity] marker-free statement was modified:\n  input  = {s}\n  output = {o}"
+        )),
+        Err(e) => Some(format!(
+            "[identity] marker-free statement errored:\n  input = {s}\n  error = {e}"
+        )),
+    }
+}
+
 /// Parse, differentiate, and run every property on one generated expression.
 /// Returns each failure report (empty ⇒ all properties held).
 fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String> {
@@ -543,6 +726,14 @@ fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String>
         out.push(f);
     }
     if let Some(f) = self_consumption_failure(ddx, &wrt_col, text) {
+        out.push(f);
+    }
+    // Statement-level rewrite_sql properties (self-generating; the `text`/`wrt`
+    // above are for the expression-level checks).
+    if let Some(f) = splice_failure(rng, ddx) {
+        out.push(f);
+    }
+    if let Some(f) = marker_free_failure(rng, ddx) {
         out.push(f);
     }
     out
@@ -634,6 +825,78 @@ fn higher_order_self_consumption_is_stable() {
     assert!(
         failures.is_empty(),
         "self-consumption fuzz found {} failure(s):\n\n{}",
+        failures.len(),
+        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+    );
+}
+
+#[test]
+fn rewrite_sql_splice_is_byte_faithful() {
+    // Statement-level fuzz of `rewrite_sql`: markers wrapped in random
+    // (Unicode-bearing) scaffolding must be spliced exactly, leaving every other
+    // byte identical (design.md §3.2, G3/F5).
+    let ddx = Ddx::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for seed in 0..4000u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ 0x5719_C0DE);
+        if let Some(report) = splice_failure(&mut rng, &ddx) {
+            failures.push(report);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "splice-fidelity fuzz found {} failure(s):\n\n{}",
+        failures.len(),
+        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+    );
+}
+
+#[test]
+#[ignore = "known bug #57: rewrite_sql under-splices a marker whose last-arg tail is a \
+            CAST/Nested (sqlparser Spanned under-reports the span end), emitting corrupt SQL"]
+fn splice_handles_marker_with_cast_or_nested_tail() {
+    // The splice must cover the *whole* marker call. When the last argument's
+    // tail is a CAST (span excludes ` AS <type>`) or a Nested `( … )` (span
+    // excludes the closing `)`), rewrite_sql currently stops early and leaves
+    // trailing bytes behind, producing unbalanced/corrupt SQL (#57).
+    let ddx = Ddx::new();
+    // jvp(sin(x), x, CAST(y AS DOUBLE)) — tangent tail is a CAST.
+    assert_eq!(
+        ddx.rewrite_sql(
+            "SELECT jvp(sin(x), x, CAST(y AS DOUBLE)) FROM t",
+            &GenericDialect {}
+        )
+        .unwrap(),
+        "SELECT (cos(x) * CAST(y AS DOUBLE)) FROM t"
+    );
+    // jvp(x, x, (y + z)) — tangent tail is a Nested `( … )`.
+    assert_eq!(
+        ddx.rewrite_sql("SELECT jvp(x, x, (y + z)) FROM t", &GenericDialect {})
+            .unwrap(),
+        "SELECT ((y + z)) FROM t"
+    );
+}
+
+#[test]
+fn marker_free_statements_are_byte_identical() {
+    // The pre-gate / no-marker guarantee: a statement with no real marker —
+    // including one whose text carries a `grad(`/`jvp(` substring in a string,
+    // comment, or qualified call — comes back byte-identical (design.md §3.2).
+    let ddx = Ddx::new();
+    let mut failures: Vec<String> = Vec::new();
+
+    for seed in 0..2000u64 {
+        let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1DE0_7175);
+        if let Some(report) = marker_free_failure(&mut rng, &ddx) {
+            failures.push(report);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "marker-free identity fuzz found {} failure(s):\n\n{}",
         failures.len(),
         failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
     );
