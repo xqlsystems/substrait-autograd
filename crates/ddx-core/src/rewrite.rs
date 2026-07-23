@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Source-to-source SQL rewriting: find every `grad`/`jvp` marker, replace it
 //! with derivative SQL, leave everything else byte-identical.
 //!

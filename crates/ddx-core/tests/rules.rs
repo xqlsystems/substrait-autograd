@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The prototype's rule unit tests, ported to `ddx-core` (design.md §3.2, M0:
 //! "port the prototype's 15 rule tests — they pin the math unchanged").
 //!

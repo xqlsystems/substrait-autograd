@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `ddx-ad` — query-level reverse-mode automatic differentiation (ddx v2).
 //!
 //! **Status: scaffold.** This crate is the home for the v2 engine described in

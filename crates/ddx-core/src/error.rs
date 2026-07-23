@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The error type for differentiation and rewriting.
 
 use std::fmt;

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end `rewrite_sql` tests: the marker path, span splicing, the guards,
 //! and identifier folding — the M0 deliverables of design.md §3.2 / §8.
 

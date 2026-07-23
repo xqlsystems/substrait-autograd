@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `ddx-core` — engine-neutral symbolic differentiation of SQL scalar
 //! expressions. The v1 core of [`ddx`](https://github.com/xqlsystems/ddx):
 //! write calculus directly in SQL and let the engine evaluate the derivative

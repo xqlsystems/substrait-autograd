@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The differentiation engine: forward-mode linearization over
 //! `sqlparser::ast::Expr`, with a name-keyed, user-extensible rule registry.
 //!

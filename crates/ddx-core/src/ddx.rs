@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The public entry point: the [`Ddx`] object.
 //!
 //! The surface is an object rather than free functions so the user rule

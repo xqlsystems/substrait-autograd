@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Column identity read off the AST, compared with per-dialect identifier
 //! folding rather than raw-string equality (design.md §3.2, F1).
 

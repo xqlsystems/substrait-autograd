@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The semantic round-trip property test (design.md §5).
 //!
 //! A test that only checks the rewritten SQL *parses* sails right past the

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Smart constructors for building derivative `sqlparser::ast::Expr` trees.
 //!
 //! These own three correctness properties, not just algebraic tidiness

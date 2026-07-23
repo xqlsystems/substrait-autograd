@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Alex Merose <al@merose.com> & ddx Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! `ddx-datafusion` — the DataFusion adapter for ddx.
 //!
 //! **Status: scaffold.** M0 lands only the crate seam. The real adapter
