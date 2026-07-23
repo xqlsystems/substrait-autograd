@@ -79,6 +79,21 @@ fn fires_inside_recursive_cte() {
 }
 
 #[test]
+fn splice_end_ignores_parens_inside_strings_and_comments() {
+    // The splice finds the call's matching `)` over the token stream, so a `)`
+    // that appears only inside a string literal or comment in a (jvp) tangent is
+    // not miscounted (#57). The tangent is spliced verbatim.
+    assert_eq!(
+        rw("SELECT jvp(x, x, CASE WHEN a = ')' THEN y ELSE z END) FROM t"),
+        "SELECT (CASE WHEN a = ')' THEN y ELSE z END) FROM t"
+    );
+    assert_eq!(
+        rw("SELECT jvp(x, x, y /* ) ) */) FROM t"),
+        "SELECT (y) FROM t"
+    );
+}
+
+#[test]
 fn dml_update_rule_is_rewritten() {
     let out = rw("INSERT INTO p SELECT theta - 0.1 * grad(x * theta, theta) FROM t");
     assert!(

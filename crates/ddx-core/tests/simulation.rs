@@ -147,10 +147,26 @@ fn gen_expr(rng: &mut Rng, depth: u32) -> String {
         };
     }
     match rng.below(11) {
-        0 => format!("({} + {})", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
-        1 => format!("({} - {})", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
-        2 => format!("({} * {})", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
-        3 => format!("({} / {})", gen_expr(rng, depth - 1), gen_expr(rng, depth - 1)),
+        0 => format!(
+            "({} + {})",
+            gen_expr(rng, depth - 1),
+            gen_expr(rng, depth - 1)
+        ),
+        1 => format!(
+            "({} - {})",
+            gen_expr(rng, depth - 1),
+            gen_expr(rng, depth - 1)
+        ),
+        2 => format!(
+            "({} * {})",
+            gen_expr(rng, depth - 1),
+            gen_expr(rng, depth - 1)
+        ),
+        3 => format!(
+            "({} / {})",
+            gen_expr(rng, depth - 1),
+            gen_expr(rng, depth - 1)
+        ),
         4 => format!("(-{})", gen_expr(rng, depth - 1)),
         5 | 6 => {
             let f = UNARY_FNS[rng.below(UNARY_FNS.len() as u64) as usize];
@@ -211,11 +227,13 @@ fn eval_mag(e: &Expr, x: f64, y: f64) -> Option<(f64, f64)> {
             "y" => here(y),
             _ => None,
         },
-        Expr::CompoundIdentifier(parts) => match parts.last()?.value.to_ascii_lowercase().as_str() {
-            "x" => here(x),
-            "y" => here(y),
-            _ => None,
-        },
+        Expr::CompoundIdentifier(parts) => {
+            match parts.last()?.value.to_ascii_lowercase().as_str() {
+                "x" => here(x),
+                "y" => here(y),
+                _ => None,
+            }
+        }
         Expr::Nested(inner) => eval_mag(inner, x, y),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
@@ -374,8 +392,8 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
     const RTOL: f64 = 2e-3;
     const ATOL: f64 = 1e-5;
     const COND_CAP: f64 = 1e5; // skip near-singular points (huge slope)
-    // Max relative gap between fd(h) and fd(h/2) for the difference to count as
-    // "in its convergent regime" and therefore trustworthy as an oracle.
+                               // Max relative gap between fd(h) and fd(h/2) for the difference to count as
+                               // "in its convergent regime" and therefore trustworthy as an oracle.
     const RICHARDSON_TOL: f64 = 1e-4;
     // Above this, some intermediate value is too large for f64 to resolve an
     // O(1) perturbation against — the point is unfit for numeric comparison
@@ -427,8 +445,10 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
         if (fd - dv).abs() > ATOL + RTOL * dv.abs().max(fd.abs()) {
             disagree += 1;
             if first_bad.is_empty() {
-                first_bad =
-                    format!("x={x0:.6} y={y0:.6}: symbolic d/d{} = {dv:.8}, finite-diff = {fd:.8}", wrt.name());
+                first_bad = format!(
+                    "x={x0:.6} y={y0:.6}: symbolic d/d{} = {dv:.8}, finite-diff = {fd:.8}",
+                    wrt.name()
+                );
             }
         }
     }
@@ -449,7 +469,10 @@ fn fidelity_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Optio
     const ATOL: f64 = 1e-11;
     let rendered = d.to_string();
     if rendered.contains("--") {
-        return Some(format!("[render] emitted a `--` comment: d/d{} {expr_text} => {rendered}", wrt.name()));
+        return Some(format!(
+            "[render] emitted a `--` comment: d/d{} {expr_text} => {rendered}",
+            wrt.name()
+        ));
     }
     let reparsed = match try_parse(&rendered) {
         Ok(rp) => rp,
@@ -562,14 +585,12 @@ const STMT_SUFFIXES: &[&str] = &[
 /// inside one arithmetic select item (` + `, ` * `).
 const STMT_MIDS: &[&str] = &[", ", " + ", " * ", ", z, "];
 
-/// Whether the splice fuzz generates `jvp` markers. Temporarily `false`:
-/// `jvp` with a compound/casted tangent trips bug #57 (`rewrite_sql`
-/// under-splices a marker whose last-arg tail is a `CAST`/`Nested`, because
-/// sqlparser's span under-reports there), which would make the bounded and soak
-/// tests permanently red. `grad`/nested markers are immune (their last arg is
-/// the bare wrt column). Flip to `true` when #57 is fixed — the minimal repro is
-/// `splice_handles_marker_with_cast_or_nested_tail` (`#[ignore]`).
-const SPLICE_FUZZ_INCLUDES_JVP: bool = false;
+/// Whether the splice fuzz generates `jvp` markers. Now `true`: #57 is fixed —
+/// `rewrite_sql` splices to the call's matching close paren (found over the
+/// token stream) rather than the under-reported `Expr::span()` end, so a `jvp`
+/// with a compound/casted tangent (last-arg tail a `CAST`/`Nested`) splices
+/// correctly. The minimal repro is `splice_handles_marker_with_cast_or_nested_tail`.
+const SPLICE_FUZZ_INCLUDES_JVP: bool = true;
 
 /// Build one marker call and the exact text `rewrite_sql` must splice in its
 /// place (`(derivative)`), or `None` if the marker's derivative is undefined
@@ -706,7 +727,9 @@ fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String>
     let parsed = match try_parse(text) {
         Ok(p) => p,
         Err(e) => {
-            out.push(format!("[generator] produced unparseable text `{text}` ({e})"));
+            out.push(format!(
+                "[generator] produced unparseable text `{text}` ({e})"
+            ));
             return out;
         }
     };
@@ -769,13 +792,21 @@ fn finite_difference_agreement_over_random_expressions() {
         }
     }
 
-    assert!(tested > 500, "generator produced too few derivable cases: {tested}");
+    assert!(
+        tested > 500,
+        "generator produced too few derivable cases: {tested}"
+    );
     assert!(
         failures.is_empty(),
         "finite-difference oracle found {} disagreement(s) out of {} tested:\n\n{}",
         failures.len(),
         tested,
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }
 
@@ -803,7 +834,12 @@ fn render_reparse_is_value_preserving() {
         failures.is_empty(),
         "render-fidelity fuzz found {} failure(s):\n\n{}",
         failures.len(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }
 
@@ -826,7 +862,12 @@ fn higher_order_self_consumption_is_stable() {
         failures.is_empty(),
         "self-consumption fuzz found {} failure(s):\n\n{}",
         failures.len(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }
 
@@ -849,13 +890,16 @@ fn rewrite_sql_splice_is_byte_faithful() {
         failures.is_empty(),
         "splice-fidelity fuzz found {} failure(s):\n\n{}",
         failures.len(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }
 
 #[test]
-#[ignore = "known bug #57: rewrite_sql under-splices a marker whose last-arg tail is a \
-            CAST/Nested (sqlparser Spanned under-reports the span end), emitting corrupt SQL"]
 fn splice_handles_marker_with_cast_or_nested_tail() {
     // The splice must cover the *whole* marker call. When the last argument's
     // tail is a CAST (span excludes ` AS <type>`) or a Nested `( … )` (span
@@ -898,7 +942,12 @@ fn marker_free_statements_are_byte_identical() {
         failures.is_empty(),
         "marker-free identity fuzz found {} failure(s):\n\n{}",
         failures.len(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }
 
@@ -907,7 +956,10 @@ fn marker_free_statements_are_byte_identical() {
 // ---------------------------------------------------------------------------
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[test]

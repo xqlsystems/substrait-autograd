@@ -34,7 +34,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Location, Span};
+use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
 
 use crate::colref::{ColRef, IdentCasing};
 use crate::engine::{differentiate, jvp, positional_args, RuleRegistry};
@@ -197,14 +197,29 @@ pub(crate) fn rewrite_sql(
 
     // 6. Compute each replacement, then splice by byte range in reverse source
     //    order so earlier offsets stay valid.
+    //
+    //    The marker name position (`span.start`) is reliable, but the Function's
+    //    `span.end` is NOT: sqlparser under-reports it when the call's last
+    //    argument ends in a `Cast` (excludes ` AS <type>`) or `Nested` (excludes
+    //    the closing `)`), so trusting it under-splices and leaves corrupt SQL
+    //    behind (#57). Instead, find the call's matching close paren over the
+    //    token stream — re-tokenizing with the same dialect, which lexes strings
+    //    and comments as single tokens so their parens don't miscount.
+    let tokens = Tokenizer::new(dialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| DiffError::Parse(format!("failed to tokenize SQL: {e}")))?;
+
     let mut repls: Vec<(usize, usize, String)> = Vec::with_capacity(collector.found.len());
     for (span, marker_expr) in &collector.found {
         let text = differentiate_marker_tree(marker_expr, casing, reg, &aliases)?;
         let start = locate(sql, span.start, false)
             .ok_or_else(|| DiffError::Internal("marker span start out of range".into()))?;
-        // sqlparser span ends are *inclusive* of the last character (verified
-        // against 0.62.0), so the exclusive byte end is one character past it.
-        let end = locate(sql, span.end, true)
+        let close = marker_call_close(&tokens, span.start).ok_or_else(|| {
+            DiffError::Internal("could not locate the marker call's closing parenthesis".into())
+        })?;
+        // `close` is the location of the `)`; the exclusive byte end is one
+        // character past it.
+        let end = locate(sql, close, true)
             .ok_or_else(|| DiffError::Internal("marker span end out of range".into()))?;
         repls.push((start, end, text));
     }
@@ -533,6 +548,38 @@ fn walk_table_factor(tf: &TableFactor, out: &mut ComputedAliases) {
         let owner = alias.as_ref().map(|a| a.name.value.to_ascii_lowercase());
         walk_query(subquery, owner.as_deref(), out);
     }
+}
+
+/// The [`Location`] of the `)` that closes the marker call whose name token
+/// starts at `name_start`, found by matching parentheses over the token stream.
+///
+/// This is authoritative where `Expr::span()` is not: sqlparser under-reports a
+/// `Function`'s span end when its last argument ends in a `Cast` (the ` AS
+/// <type>` tail is excluded) or a `Nested` (the closing `)` is excluded), so a
+/// span-based splice leaves trailing bytes behind and corrupts the output
+/// (#57). Matching over tokens is exact because the tokenizer lexes string
+/// literals and comments into single tokens, so parentheses inside them are
+/// never counted. The marker name position (`name_start`) is itself reliable;
+/// between it and the call's `(` there is only trivia (skipped here).
+fn marker_call_close(tokens: &[TokenWithSpan], name_start: Location) -> Option<Location> {
+    let mut depth = 0usize;
+    let mut opened = false;
+    for t in tokens.iter().filter(|t| t.span.start >= name_start) {
+        match t.token {
+            Token::LParen => {
+                depth += 1;
+                opened = true;
+            }
+            Token::RParen => {
+                depth = depth.checked_sub(1)?;
+                if opened && depth == 0 {
+                    return Some(t.span.start);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
