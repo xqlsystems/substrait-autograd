@@ -22,8 +22,8 @@ assert_eq!(out, "SELECT (cos(x)) AS d FROM t");
 ```
 
 The engine differentiates [`sqlparser::ast::Expr`](https://docs.rs/sqlparser)
-directly — the AST *is* the IR, there is no bespoke representation. The single
-load-bearing dependency is `sqlparser`, **re-exported** as `ddx_core::sqlparser`
+directly — the AST *is* the IR, there is no bespoke representation. The primary 
+dependency is `sqlparser`, **re-exported** as `ddx_core::sqlparser`
 so downstream adapters cannot link a mismatched version.
 
 ## What it supports
