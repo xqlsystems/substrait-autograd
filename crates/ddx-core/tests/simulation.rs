@@ -53,7 +53,11 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
-use ddx_core::sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value};
+use std::ops::ControlFlow;
+
+use ddx_core::sqlparser::ast::{
+    BinaryOperator, Expr, Function, ObjectNamePart, UnaryOperator, Value, Visit, Visitor,
+};
 use ddx_core::sqlparser::dialect::GenericDialect;
 use ddx_core::sqlparser::parser::Parser;
 use ddx_core::{ColRef, Ddx, DiffError};
@@ -490,14 +494,28 @@ fn fidelity_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Optio
         }
         let x0 = rng.range(0.2, 1.8);
         let y0 = rng.range(0.2, 1.8);
+        // Tolerance relative to the computation *scale*, not the result (#54's
+        // lesson, generalized — see `metamorphic_mismatch`). AST-vs-reparse
+        // differ only by float *association* (the `a·(b/c)` → `(a·b)/c` reprint,
+        // issue #50), which agrees to ≈ ε·scale — so at a huge-magnitude point
+        // (`sinh(16/…)`, deriv ≈ 1e62) or a cancellation/near-pole point
+        // (`tan(exp(…))`) a result-relative tolerance false-positives. Skip the
+        // point only if the scale is non-finite/overflowing.
+        let scale = match (
+            max_intermediate_mag(d, x0, y0),
+            max_intermediate_mag(&reparsed, x0, y0),
+        ) {
+            (Some(a), Some(b)) if a.is_finite() && b.is_finite() && a.max(b) < 1e300 => a.max(b),
+            _ => continue,
+        };
         let (Some(va), Some(vb)) = (eval(d, x0, y0), eval(&reparsed, x0, y0)) else {
             continue;
         };
-        if !va.is_finite() || !vb.is_finite() || va.abs() > 1e6 {
+        if !va.is_finite() || !vb.is_finite() {
             continue;
         }
         compared += 1;
-        if (va - vb).abs() > ATOL + RTOL * va.abs() {
+        if (va - vb).abs() > ATOL + RTOL * scale {
             return Some(format!(
                 "[render] render changed the value: d/d{} {expr_text}\n  rendered = {rendered}\n  at x={x0:.4} y={y0:.4}: AST = {va:.10}, reparsed = {vb:.10}",
                 wrt.name()
@@ -639,7 +657,11 @@ fn gen_marker_segment(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
 /// (Unicode-bearing) scaffolding and assert `rewrite_sql` splices each marker
 /// exactly, byte-for-byte, leaving all surrounding text untouched. If any
 /// marker's derivative is undefined, the whole rewrite must error instead.
-fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+/// Assemble a random marker-bearing statement: 1–3 markers wrapped in random
+/// (Unicode-bearing) scaffolding. Returns `(input, expected)` where `expected`
+/// is the exact byte-for-byte `rewrite_sql` output, or `None` if some marker's
+/// derivative is undefined (in which case the whole rewrite must error).
+fn gen_marker_statement(rng: &mut Rng, ddx: &Ddx) -> (String, Option<String>) {
     let n = 1 + rng.below(3) as usize;
     let prefix = STMT_PREFIXES[rng.below(STMT_PREFIXES.len() as u64) as usize];
     let suffix = STMT_SUFFIXES[rng.below(STMT_SUFFIXES.len() as u64) as usize];
@@ -663,8 +685,13 @@ fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
     input.push_str(suffix);
     expected.push_str(suffix);
 
+    (input, if any_undefined { None } else { Some(expected) })
+}
+
+fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let (input, expected) = gen_marker_statement(rng, ddx);
     let got = ddx.rewrite_sql(&input, &GenericDialect {});
-    if any_undefined {
+    let Some(expected) = expected else {
         // At least one marker's derivative is undefined → the whole rewrite must
         // fail loud, never partially rewrite.
         return match got {
@@ -673,7 +700,7 @@ fn splice_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
                 "[splice] expected an error (a marker derivative is undefined) but got Ok:\n  input  = {input}\n  output = {o}"
             )),
         };
-    }
+    };
     match got {
         Ok(o) if o == expected => None,
         Ok(o) => Some(format!(
@@ -720,6 +747,361 @@ fn marker_free_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Additional invariants (issue #58).
+// ---------------------------------------------------------------------------
+
+/// Parse a whole statement (not just an expression).
+fn try_parse_stmt(sql: &str) -> Result<Vec<ddx_core::sqlparser::ast::Statement>, String> {
+    Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| e.to_string())
+}
+
+/// Does an AST still contain an *unqualified* `grad`/`jvp` call — a marker that
+/// should have been rewritten away?
+#[derive(Default)]
+struct MarkerScan {
+    found: bool,
+}
+impl Visitor for MarkerScan {
+    type Break = ();
+    fn pre_visit_expr(&mut self, e: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(Function { name, .. }) = e {
+            if let [ObjectNamePart::Identifier(id)] = name.0.as_slice() {
+                let n = id.value.to_ascii_lowercase();
+                if n == "grad" || n == "jvp" {
+                    self.found = true;
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn has_residual_marker(stmts: &[ddx_core::sqlparser::ast::Statement]) -> bool {
+    let mut scan = MarkerScan::default();
+    for s in stmts {
+        let _ = Visit::visit(s, &mut scan);
+        if scan.found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Invariant 1: the SQL `rewrite_sql` emits must always re-parse and contain no
+/// residual marker. A *broad* net over the rewrite path — it needs no predicted
+/// output, so it tolerates arbitrary scaffolding, and it independently catches
+/// corruption bugs like #57 (the corrupt output fails to re-parse).
+fn rewrite_validity_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let (input, expected) = gen_marker_statement(rng, ddx);
+    let out = match ddx.rewrite_sql(&input, &GenericDialect {}) {
+        Ok(o) => o,
+        // An undefined-derivative marker legitimately errors (fail loud).
+        Err(_) if expected.is_none() => return None,
+        Err(e) => {
+            return Some(format!(
+                "[validity] rewrite_sql errored on a valid marker statement:\n  input = {input}\n  error = {e}"
+            ))
+        }
+    };
+    match try_parse_stmt(&out) {
+        Err(e) => Some(format!(
+            "[validity] rewrite_sql emitted unparseable SQL:\n  input  = {input}\n  output = {out}\n  parse error = {e}"
+        )),
+        Ok(stmts) if has_residual_marker(&stmts) => Some(format!(
+            "[validity] rewrite_sql left a residual grad/jvp marker:\n  input  = {input}\n  output = {out}"
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// Invariant 5: `rewrite_sql` is idempotent — a second pass over its own output
+/// is a no-op (no markers remain to rewrite, and the text is stable).
+fn idempotence_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let (input, _) = gen_marker_statement(rng, ddx);
+    let once = match ddx.rewrite_sql(&input, &GenericDialect {}) {
+        Ok(o) => o,
+        Err(_) => return None, // undefined-derivative markers error; fine here
+    };
+    match ddx.rewrite_sql(&once, &GenericDialect {}) {
+        Ok(twice) if twice == once => None,
+        Ok(twice) => Some(format!(
+            "[idempotence] rewrite_sql is not idempotent:\n  input = {input}\n  once  = {once}\n  twice = {twice}"
+        )),
+        Err(e) => Some(format!(
+            "[idempotence] rewrite_sql errored on its own output:\n  input = {input}\n  once  = {once}\n  error = {e}"
+        )),
+    }
+}
+
+/// Adversarial / malformed inputs for the never-panic invariant.
+fn gen_adversarial_sql(rng: &mut Rng) -> String {
+    const UNI: &[&str] = &[
+        "héllo",
+        "☕🔥",
+        "naïve",
+        "Ωμέγα",
+        "🇺🇸",
+        "e\u{0301}",
+        "\u{202E}rtl",
+        "𝕏𝕐",
+    ];
+    match rng.below(8) {
+        // Malformed marker arities / shapes — must be typed errors, not panics.
+        0 => [
+            "SELECT grad() FROM t",
+            "SELECT grad(x) FROM t",
+            "SELECT grad(x, y, z) FROM t",
+            "SELECT jvp(x, x) FROM t",
+            "SELECT jvp(x) FROM t",
+            "SELECT grad(x, 1 + 2) FROM t",
+            "SELECT grad(*, x) FROM t",
+            "SELECT grad(x, ) FROM t",
+        ][rng.below(8) as usize]
+            .to_string(),
+        // A valid marker behind a Unicode-heavy prefix (stresses `locate`).
+        1 => {
+            let u = UNI[rng.below(UNI.len() as u64) as usize];
+            let depth = 2 + rng.below(2) as u32;
+            format!(
+                "SELECT '{u}' AS c, grad({}, x) FROM t",
+                gen_expr(rng, depth)
+            )
+        }
+        // Deeply nested markers.
+        2 => {
+            let k = 1 + rng.below(12) as usize;
+            let mut s = String::from("SELECT ");
+            for _ in 0..k {
+                s.push_str("grad(");
+            }
+            s.push('x');
+            for _ in 0..k {
+                s.push_str(", x)");
+            }
+            s.push_str(" FROM t");
+            s
+        }
+        // A valid marker statement truncated at a random char boundary.
+        3 => {
+            let (full, _) = ("SELECT café AS c, grad(sin(x) * y, x) FROM t", ());
+            let cut = full
+                .char_indices()
+                .nth(1 + rng.below(full.chars().count() as u64) as usize)
+                .map(|(i, _)| i)
+                .unwrap_or(full.len());
+            full[..cut].to_string()
+        }
+        // Marker with a Unicode identifier argument.
+        4 => {
+            let u = UNI[rng.below(UNI.len() as u64) as usize];
+            format!("SELECT grad({u}, x) FROM t")
+        }
+        // Unicode injected into a valid marker statement at a char boundary.
+        5 => {
+            let u = UNI[rng.below(UNI.len() as u64) as usize];
+            let base = "SELECT grad(sin(x), x) FROM t";
+            let at = base
+                .char_indices()
+                .nth(rng.below(base.chars().count() as u64) as usize)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let mut s = String::from(&base[..at]);
+            s.push_str(u);
+            s.push_str(&base[at..]);
+            s
+        }
+        // Odd whitespace/comments around the marker (the #52 family).
+        6 => "SELECT grad\t(\n x , x )/* ☕ */ FROM t".to_string(),
+        // A deep but valid marker payload.
+        _ => {
+            let depth = 3 + rng.below(3) as u32;
+            format!("SELECT grad({}, x) FROM t", gen_expr(rng, depth))
+        }
+    }
+}
+
+/// Invariant 2: `rewrite_sql` never *panics* — for any input, adversarial or
+/// malformed, it returns `Ok` or a typed `DiffError` (design principle 5: fail
+/// loud, never crash). The prime suspects are the UTF-8 `locate` math and the
+/// span logic.
+fn panic_failure(rng: &mut Rng, ddx: &Ddx) -> Option<String> {
+    let input = gen_adversarial_sql(rng);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Return a bool so nothing non-UnwindSafe crosses the boundary.
+        ddx.rewrite_sql(&input, &GenericDialect {}).is_ok()
+    }));
+    match result {
+        Ok(_) => None,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            Some(format!(
+                "[panic] rewrite_sql PANICKED (must return a typed error instead):\n  input = {input:?}\n  panic = {msg}"
+            ))
+        }
+    }
+}
+
+/// Invariant 4: `d/dv` of an expression that does not mention `v` is exactly
+/// zero. Differentiating w.r.t. the fresh variable `w` (which the generator
+/// never emits) must fold to a value-0 derivative — a crisp check of the
+/// 0-folding smart constructors and the leaf `Match::Not` classification.
+fn zero_derivative_failure(rng: &mut Rng, ddx: &Ddx, text: &str) -> Option<String> {
+    let f = parse_expr(text);
+    let d = match ddx.differentiate(&f, &ColRef::bare("w")) {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    for _ in 0..12 {
+        let x0 = rng.range(0.2, 1.8);
+        let y0 = rng.range(0.2, 1.8);
+        if let Some(v) = eval(&d, x0, y0) {
+            if v.is_finite() && v.abs() > 1e-12 {
+                return Some(format!(
+                    "[zero-deriv] d/dw {text} is not zero (w is absent):\n  => {d}\n  at x={x0:.4} y={y0:.4}: value = {v}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Invariant 6: the engine never emits an `inf`/`nan` token in a derivative
+/// (design principle 5 / #33 — a non-finite constant is a typed error, never an
+/// invalid literal in the output text).
+fn no_inf_nan_failure(text: &str, d: &Expr) -> Option<String> {
+    let rendered = d.to_string();
+    let low = rendered.to_ascii_lowercase();
+    if low.contains("inf") || low.contains("nan") {
+        return Some(format!(
+            "[inf-nan] derivative text contains an inf/nan token:\n  d/d? {text}\n  => {rendered}"
+        ));
+    }
+    None
+}
+
+/// Compare a symbolic `lhs` expression to a `rhs` value closure at random
+/// points, returning the first genuine disagreement. Used for the exact
+/// metamorphic identities (jvp↔grad, linearity) — as exact identities, not
+/// finite differences, they need no majority vote.
+///
+/// **Tolerance is relative to the computation scale, not the result** — the
+/// #54 lesson, generalized. `lhs` and `rhs` compute the same value by different
+/// *associations* (e.g. jvp distributes the tangent into each product term
+/// while `t·grad` factors it out; render→reparse turns `a·(b/c)` into `(a·b)/c`,
+/// issue #50). Those agree only up to ≈ `ε · (magnitude of the intermediates)`,
+/// which *explodes past a result-relative tolerance* at a cancellation or
+/// near-singular point (`x⁻¹ − x·x⁻² → 0`, `tan` near a pole). A real rule bug,
+/// by contrast, perturbs the result by a finite fraction of its own scale, so it
+/// still exceeds `RTOL · scale` at well-conditioned points — the check keeps its
+/// teeth while shedding the float-noise false positives.
+fn metamorphic_mismatch(
+    rng: &mut Rng,
+    gate: &[&Expr],
+    lhs: &Expr,
+    rhs: impl Fn(f64, f64) -> Option<f64>,
+) -> Option<(f64, f64, f64, f64)> {
+    const RTOL: f64 = 1e-7;
+    const ATOL: f64 = 1e-9;
+    for _ in 0..40 {
+        let x0 = rng.range(0.2, 1.8);
+        let y0 = rng.range(0.2, 1.8);
+        // Scale = the largest intermediate magnitude across every expression
+        // involved; skip the point if any is non-finite or overflowing.
+        let mut scale = 0.0f64;
+        let mut ok = true;
+        for e in gate.iter().chain(std::iter::once(&lhs)) {
+            match max_intermediate_mag(e, x0, y0) {
+                Some(m) if m.is_finite() && m < 1e300 => scale = scale.max(m),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let (Some(a), Some(b)) = (eval(lhs, x0, y0), rhs(x0, y0)) else {
+            continue;
+        };
+        if !a.is_finite() || !b.is_finite() {
+            continue;
+        }
+        if (a - b).abs() > ATOL + RTOL * scale {
+            return Some((x0, y0, a, b));
+        }
+    }
+    None
+}
+
+/// Invariant 3: `jvp(f, wrt, t)` equals `t · grad(f, wrt)` (forward mode is
+/// linear in the seed). Ties the two forward-mode entry points; `jvp` is where
+/// #57 lived.
+fn jvp_consistency_failure(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Option<String> {
+    let f = parse_expr(text);
+    let wrt_col = ColRef::bare(wrt.name());
+    let tan_depth = 1 + rng.below(2) as u32;
+    let t_text = gen_expr(rng, tan_depth);
+    let t = parse_expr(&t_text);
+    let grad_e = ddx.differentiate(&f, &wrt_col).ok()?;
+    let jvp_e = ddx.jvp(&f, &[(wrt_col, t.clone())]).ok()?;
+    let gate = [&f, &t, &grad_e];
+    if let Some((x0, y0, a, b)) = metamorphic_mismatch(rng, &gate, &jvp_e, |x, y| {
+        Some(eval(&t, x, y)? * eval(&grad_e, x, y)?)
+    }) {
+        return Some(format!(
+            "[jvp≠t·grad] jvp({text}, {w}, {t_text}) ≠ tangent·grad:\n  jvp  => {jvp_e}\n  grad => {grad_e}\n  at x={x0:.4} y={y0:.4}: jvp = {a}, t·grad = {b}",
+            w = wrt.name()
+        ));
+    }
+    None
+}
+
+/// Invariant 7: linearity and the product rule as exact metamorphic identities,
+/// `d(f+g) = d(f)+d(g)` and `d(f·g) = d(f)·g + f·d(g)`, value-checked. An exact
+/// algebraic cross-check independent of the finite-difference oracle — it holds
+/// even at the high-magnitude points the FD oracle skips.
+fn linearity_failure(rng: &mut Rng, ddx: &Ddx, f_text: &str, wrt: Var) -> Option<String> {
+    let wrt_col = ColRef::bare(wrt.name());
+    let f = parse_expr(f_text);
+    let g_depth = 2 + rng.below(2) as u32;
+    let g_text = gen_expr(rng, g_depth);
+    let g = parse_expr(&g_text);
+    let df = ddx.differentiate(&f, &wrt_col).ok()?;
+    let dg = ddx.differentiate(&g, &wrt_col).ok()?;
+
+    // Sum rule.
+    let sum = parse_expr(&format!("({f_text}) + ({g_text})"));
+    let dsum = ddx.differentiate(&sum, &wrt_col).ok()?;
+    let gate_sum = [&f, &g, &df, &dg];
+    if let Some((x0, y0, a, b)) = metamorphic_mismatch(rng, &gate_sum, &dsum, |x, y| {
+        Some(eval(&df, x, y)? + eval(&dg, x, y)?)
+    }) {
+        return Some(format!(
+            "[linearity] d(f+g) ≠ d(f)+d(g):\n  f = {f_text}\n  g = {g_text}\n  d(f+g) => {dsum}\n  at x={x0:.4} y={y0:.4}: lhs = {a}, rhs = {b}"
+        ));
+    }
+
+    // Product rule.
+    let prod = parse_expr(&format!("({f_text}) * ({g_text})"));
+    let dprod = ddx.differentiate(&prod, &wrt_col).ok()?;
+    let gate_prod = [&f, &g, &df, &dg];
+    if let Some((x0, y0, a, b)) = metamorphic_mismatch(rng, &gate_prod, &dprod, |x, y| {
+        Some(eval(&df, x, y)? * eval(&g, x, y)? + eval(&f, x, y)? * eval(&dg, x, y)?)
+    }) {
+        return Some(format!(
+            "[product-rule] d(f*g) ≠ d(f)*g + f*d(g):\n  f = {f_text}\n  g = {g_text}\n  d(f*g) => {dprod}\n  at x={x0:.4} y={y0:.4}: lhs = {a}, rhs = {b}"
+        ));
+    }
+    None
+}
+
 /// Parse, differentiate, and run every property on one generated expression.
 /// Returns each failure report (empty ⇒ all properties held).
 fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String> {
@@ -751,12 +1133,34 @@ fn run_all_checks(rng: &mut Rng, ddx: &Ddx, text: &str, wrt: Var) -> Vec<String>
     if let Some(f) = self_consumption_failure(ddx, &wrt_col, text) {
         out.push(f);
     }
+    // Expression-level metamorphic / structural invariants (#58).
+    if let Some(f) = no_inf_nan_failure(text, &d) {
+        out.push(f);
+    }
+    if let Some(f) = zero_derivative_failure(rng, ddx, text) {
+        out.push(f);
+    }
+    if let Some(f) = jvp_consistency_failure(rng, ddx, text, wrt) {
+        out.push(f);
+    }
+    if let Some(f) = linearity_failure(rng, ddx, text, wrt) {
+        out.push(f);
+    }
     // Statement-level rewrite_sql properties (self-generating; the `text`/`wrt`
     // above are for the expression-level checks).
     if let Some(f) = splice_failure(rng, ddx) {
         out.push(f);
     }
     if let Some(f) = marker_free_failure(rng, ddx) {
+        out.push(f);
+    }
+    if let Some(f) = rewrite_validity_failure(rng, ddx) {
+        out.push(f);
+    }
+    if let Some(f) = idempotence_failure(rng, ddx) {
+        out.push(f);
+    }
+    if let Some(f) = panic_failure(rng, ddx) {
         out.push(f);
     }
     out
@@ -949,6 +1353,101 @@ fn marker_free_statements_are_byte_identical() {
             .collect::<Vec<_>>()
             .join("\n\n")
     );
+}
+
+/// Run a per-seed check over a fixed range, asserting no failures. Shared by the
+/// bounded tests for the #58 invariants.
+fn run_bounded<F: FnMut(&mut Rng) -> Option<String>>(label: &str, n: u64, salt: u64, mut check: F) {
+    let mut failures: Vec<String> = Vec::new();
+    for seed in 0..n {
+        let mut rng = Rng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ salt);
+        if let Some(report) = check(&mut rng) {
+            failures.push(report);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{label} found {} failure(s):\n\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(15)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+}
+
+/// A random derivable expression plus a random differentiation variable.
+fn gen_expr_and_wrt(rng: &mut Rng) -> (String, Var) {
+    let depth = 2 + rng.below(4) as u32;
+    let text = gen_expr(rng, depth);
+    let wrt = if rng.below(2) == 0 { Var::X } else { Var::Y };
+    (text, wrt)
+}
+
+#[test]
+fn rewrite_sql_output_is_valid_and_marker_free() {
+    let ddx = Ddx::new();
+    run_bounded("rewrite validity fuzz", 4000, 0x5A11_D000, |rng| {
+        rewrite_validity_failure(rng, &ddx)
+    });
+}
+
+#[test]
+fn rewrite_sql_never_panics_on_adversarial_input() {
+    let ddx = Ddx::new();
+    run_bounded("never-panic fuzz", 5000, 0x9A11_C000, |rng| {
+        panic_failure(rng, &ddx)
+    });
+}
+
+#[test]
+fn jvp_equals_tangent_times_grad() {
+    let ddx = Ddx::new();
+    run_bounded("jvp↔grad consistency fuzz", 4000, 0x0F5E_ED00, |rng| {
+        let (text, wrt) = gen_expr_and_wrt(rng);
+        jvp_consistency_failure(rng, &ddx, &text, wrt)
+    });
+}
+
+#[test]
+fn derivative_of_absent_variable_is_zero() {
+    let ddx = Ddx::new();
+    run_bounded("zero-derivative fuzz", 4000, 0x2E50_1000, |rng| {
+        let depth = 2 + rng.below(4) as u32;
+        let text = gen_expr(rng, depth);
+        zero_derivative_failure(rng, &ddx, &text)
+    });
+}
+
+#[test]
+fn rewrite_sql_is_idempotent() {
+    let ddx = Ddx::new();
+    run_bounded("idempotence fuzz", 4000, 0x1DE1_1000, |rng| {
+        idempotence_failure(rng, &ddx)
+    });
+}
+
+#[test]
+fn no_inf_or_nan_token_is_ever_emitted() {
+    let ddx = Ddx::new();
+    run_bounded("inf/nan-token fuzz", 4000, 0x1FFF_F000, |rng| {
+        let (text, wrt) = gen_expr_and_wrt(rng);
+        let d = ddx
+            .differentiate(&parse_expr(&text), &ColRef::bare(wrt.name()))
+            .ok()?;
+        no_inf_nan_failure(&text, &d)
+    });
+}
+
+#[test]
+fn differentiation_is_linear_and_obeys_the_product_rule() {
+    let ddx = Ddx::new();
+    run_bounded("linearity/product-rule fuzz", 4000, 0x114E_A200, |rng| {
+        let (text, wrt) = gen_expr_and_wrt(rng);
+        linearity_failure(rng, &ddx, &text, wrt)
+    });
 }
 
 // ---------------------------------------------------------------------------
