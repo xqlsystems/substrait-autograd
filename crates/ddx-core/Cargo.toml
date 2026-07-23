@@ -1,6 +1,6 @@
 [package]
 name = "ddx-core"
-description = "Engine-neutral symbolic differentiation of SQL scalar expressions (the v1 core of ddx: grad/jvp as a query rewrite)."
+description = "Engine-neutral symbolic differentiation of SQL scalar expressions: `grad` & `jvp`."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

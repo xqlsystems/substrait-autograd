@@ -1,6 +1,6 @@
 [package]
 name = "ddx-datafusion"
-description = "DataFusion adapter for ddx: the one-line ddx_sql helper (Path A) plus marker UDFs + AnalyzerRule bridge (Path B). Scaffold — see docs/design.md §3.3 and milestone M2."
+description = "DataFusion adapter for ddx."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
