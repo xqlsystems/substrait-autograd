@@ -358,6 +358,77 @@ fn eval_function(f: &ddx_core::sqlparser::ast::Function, x: f64, y: f64) -> Opti
     Some((v, argmag.max(v.abs())))
 }
 
+/// The smallest distance from any *restricted-domain* function call in `e` to
+/// its domain boundary at `(x, y)` — `f64::INFINITY` if there are none.
+///
+/// The derivative of a restricted-domain primitive is singular *at* the
+/// boundary even where the primal is finite (design.md §5, "domain-widening"):
+/// `acos`/`asin` have `±1` (`d = ∓1/√(1−u²)`), `sqrt`/`ln`/`log` have `0`
+/// (`d = 1/(2√u)`, `1/u`), and division has a `0` denominator. Near such a
+/// boundary the symbolic derivative is a `0·∞`/`∞` form that f64 evaluates to
+/// garbage — e.g. `sqrt(acos(x·0.5^log2(x)))` where the argument is *identically
+/// 1*. The finite-difference oracle skips these points rather than mistake a
+/// numerically-singular (but symbolically correct) derivative for a bug.
+fn min_domain_margin(e: &Expr, x: f64, y: f64) -> Option<f64> {
+    use ddx_core::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        Expr::Value(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_) => Some(f64::INFINITY),
+        Expr::Nested(i) => min_domain_margin(i, x, y),
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => min_domain_margin(expr, x, y),
+        Expr::BinaryOp { left, op, right } => {
+            let mut m = min_domain_margin(left, x, y)?.min(min_domain_margin(right, x, y)?);
+            if matches!(op, BinaryOperator::Divide) {
+                m = m.min(eval(right, x, y)?.abs());
+            }
+            Some(m)
+        }
+        Expr::Function(Function {
+            name,
+            args: FunctionArguments::List(list),
+            ..
+        }) => {
+            let mut arg_exprs = Vec::new();
+            let mut m = f64::INFINITY;
+            for a in &list.args {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(ae)) = a else {
+                    return Some(f64::INFINITY);
+                };
+                m = m.min(min_domain_margin(ae, x, y)?);
+                arg_exprs.push(ae);
+            }
+            let fname = match name.0.as_slice() {
+                [ObjectNamePart::Identifier(id)] => id.value.to_ascii_lowercase(),
+                _ => return Some(m),
+            };
+            if let Some(a0) = arg_exprs.first() {
+                let v = eval(a0, x, y)?;
+                m = m.min(match fname.as_str() {
+                    "asin" | "acos" => 1.0 - v.abs(),
+                    "sqrt" | "ln" | "log2" | "log10" => v,
+                    _ => f64::INFINITY,
+                });
+            }
+            Some(m)
+        }
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            let mut m = f64::INFINITY;
+            for w in conditions {
+                m = m.min(min_domain_margin(&w.condition, x, y)?);
+                m = m.min(min_domain_margin(&w.result, x, y)?);
+            }
+            if let Some(er) = else_result {
+                m = m.min(min_domain_margin(er, x, y)?);
+            }
+            Some(m)
+        }
+        _ => Some(f64::INFINITY),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The three property checks, as reusable helpers.
 // ---------------------------------------------------------------------------
@@ -405,6 +476,10 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
     // collapse to the same wrong value, so this magnitude gate is what catches
     // it — #54).
     const MAG_CAP: f64 = 1e8;
+    // Skip points within this distance of a restricted-domain boundary
+    // (`acos`/`asin` at ±1, `sqrt`/`ln`/`log` at 0, division at 0), where the
+    // symbolic derivative is a singular `0·∞` form f64 can't evaluate.
+    const DOMAIN_EPS: f64 = 1e-3;
 
     let f = parse_expr(expr_text);
     let mut comparable = 0u32;
@@ -417,6 +492,20 @@ fn fd_failure(rng: &mut Rng, expr_text: &str, d: &Expr, wrt: Var) -> Option<Stri
         }
         let x0 = rng.range(0.2, 1.8);
         let y0 = rng.range(0.2, 1.8);
+        // Domain-edge gate: skip if the primal is near a restricted-domain
+        // boundary anywhere in the finite-difference window (design.md §5).
+        let near_edge = [
+            (x0, y0),
+            (x0 + H, y0),
+            (x0 - H, y0),
+            (x0, y0 + H),
+            (x0, y0 - H),
+        ]
+        .iter()
+        .any(|&(px, py)| matches!(min_domain_margin(&f, px, py), Some(m) if m < DOMAIN_EPS));
+        if near_edge {
+            continue;
+        }
         // Magnitude gate: skip points where f (or its derivative) exercises an
         // intermediate too large for f64 to resolve a perturbation against.
         let fmag = max_intermediate_mag(&f, x0, y0);
